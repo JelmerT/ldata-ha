@@ -1503,14 +1503,21 @@ class LDATAService:
         return power_changed
 
     def _apply_ldata_energy(
-        self, breaker: dict, raw: dict, source: str, received: float | None = None
+        self,
+        breaker: dict,
+        raw: dict,
+        source: str,
+        received: float | None = None,
+        connected: bool | None = None,
     ) -> bool:
         """Book an LDATA breaker's energyConsumption values in the energy ledger.
 
         On LDATA panels these are the kWh used in the hour that just ended
         (WebSocket burst at HH:00:29, REST listing), or occasionally the
-        lifetime counter; the ledger tells them apart. Returns True if the
-        ledger changed.
+        lifetime counter; the ledger tells them apart. While the panel is
+        offline (``connected``; by default the cached panel state) only
+        lifetime counters are applied: the listing then shows the last delta
+        again. Returns True if the ledger changed.
         """
         values = {}
         if "energyConsumption" in raw:
@@ -1525,6 +1532,8 @@ class LDATAService:
         rating = raw.get("currentRating")
         if rating is None:
             rating = breaker.get("rating")
+        if connected is None:
+            connected = self._ldata_panel_connected(breaker.get("panel_id"))
         return self.energy_ledger.apply(
             breaker.get("stable_id") or breaker["id"],
             rating,
@@ -1532,7 +1541,15 @@ class LDATAService:
             time.time() if received is None else received,
             source,
             name=breaker.get("name"),
+            connected=connected,
         )
+
+    def _ldata_panel_connected(self, panel_id: str | None) -> bool:
+        """Return the cached connected state of a panel (True if unknown)."""
+        for panel in (self.status_data or {}).get("panels") or []:
+            if panel.get("id") == panel_id:
+                return bool(panel.get("connected", True))
+        return True
 
     def _apply_ct_update(self, existing: dict, raw: dict) -> None:
         """Apply a CT update from any source (REST, WS direct, WS embedded).
@@ -2196,7 +2213,9 @@ class LDATAService:
                                 )
 
                         if panel_data["panel_type"] == "LDATA":
-                            self._apply_ldata_energy(breaker_data, breaker, "REST")
+                            self._apply_ldata_energy(
+                                breaker_data, breaker, "REST", connected=panel_data["connected"]
+                            )
 
                         # Add the breaker to the list.
                         breakers[breaker["id"]] = breaker_data
@@ -2545,7 +2564,9 @@ class LDATAService:
         """Return True if an LDATA breaker is missing the last hourly burst.
 
         Checked from REST_SETTLE_SECS into the hour (the burst arrives at
-        HH:00:29), at most once per hour.
+        HH:00:29), at most once per hour. A breaker on a panel that is
+        offline is skipped: the listing has no new delta for it, and the
+        check runs again once the panel is back.
         """
         if not self._ldata_panel_ids or not self.status_data:
             return False
@@ -2559,6 +2580,7 @@ class LDATAService:
             not self.energy_ledger.has_delta_for(b.get("stable_id") or b_id, hour)
             for b_id, b in self.status_data.get("breakers", {}).items()
             if b.get("panel_id") in self._ldata_panel_ids
+            and self._ldata_panel_connected(b.get("panel_id"))
         )
 
     def refresh_ldata_energy(self) -> bool:
@@ -2585,6 +2607,7 @@ class LDATAService:
         breakers = self.status_data.get("breakers", {})
         changed = False
         read_ok = False
+        all_connected = True
         for residence_id in self.residence_id_list:
             result = self._get_retry_dropped_connection(
                 f"https://my.leviton.com/api/Residences/{residence_id}/residentialBreakerPanels",
@@ -2600,11 +2623,23 @@ class LDATAService:
             for panel in result.json():
                 if panel.get("id") not in self._ldata_panel_ids:
                     continue
+                # An offline panel's listing shows the last delta again (no
+                # burst reached the cloud), so only lifetime counters are
+                # taken from it, and the hour is checked again later.
+                connected = self._is_panel_connected(panel)
+                if not connected:
+                    all_connected = False
+                    _LOGGER.debug(
+                        f"[v{self.version}] LDATA energy recovery: panel {panel.get('id')} is "
+                        f"offline — not booking its listing values"
+                    )
                 for raw in panel.get("residentialBreakers") or []:
                     breaker = breakers.get(raw.get("id"))
-                    if breaker and self._apply_ldata_energy(breaker, raw, "REST", received=now):
+                    if breaker and self._apply_ldata_energy(
+                        breaker, raw, "REST", received=now, connected=connected
+                    ):
                         changed = True
-        if read_ok:
+        if read_ok and all_connected:
             self._energy_recovery_hour = delta_hour(now)
             _LOGGER.debug(f"[v{self.version}] LDATA energy recovery from listing: ledger {'updated' if changed else 'unchanged'}")
         return changed

@@ -3,6 +3,7 @@
 import datetime
 import http.client
 import json
+import math
 import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -148,15 +149,16 @@ def test_lifetime_counter_adds_missed_bursts_and_blocks_current_hour() -> None:
     ledger.apply("tech", 15, {"1": 0.5}, _ts(14, 13, 0, 29), "WS")
 
     # Bursts for 13-14h, 14-15h and 15-16h were missed; the counter at 16:20
-    # shows 1.4 kWh more than the ledger.
+    # is 1.4 kWh above the ledger. The reference only puts the cloud total
+    # in 1156.3..1156.4, so 1.3 kWh is proven missing and added.
     assert ledger.apply("tech", 15, {"1": 1158.2}, _ts(14, 16, 20), "WS")
-    assert ledger.lifetime("tech") == pytest.approx(1.9)
-    assert _today(ledger, "tech", 14) == pytest.approx(1.9)
+    assert ledger.lifetime("tech") == pytest.approx(1.8)
+    assert _today(ledger, "tech", 14) == pytest.approx(1.8)
 
     # The counter covered 16:00-16:20, so the 16-17h burst is not booked again.
     assert not ledger.apply("tech", 15, {"1": 0.6}, _ts(14, 17, 0, 29), "WS")
     assert ledger.apply("tech", 15, {"1": 0.6}, _ts(14, 18, 0, 29), "WS")
-    assert ledger.lifetime("tech") == pytest.approx(2.5)
+    assert ledger.lifetime("tech") == pytest.approx(2.4)
 
 
 def test_lower_lifetime_counter_never_lowers_the_ledger() -> None:
@@ -166,11 +168,15 @@ def test_lower_lifetime_counter_never_lowers_the_ledger() -> None:
 
     ledger.apply("tech", 15, {"1": 1156.5}, _ts(14, 13, 30), "WS")
     assert ledger.lifetime("tech") == pytest.approx(0.5)
+    # The cloud total is below 1156.6 and the ledger holds 0.5 kWh, so the
+    # offset is at most 1156.1 (it was at most 1156.4).
+    assert _leg(ledger)["offset_max"] == pytest.approx(1156.1)
 
-    # The bursts for 13-14h and 14-15h are missed. The lowered reference
-    # (1156.0) means the counter at 15:10 shows 2.1 kWh missing, not 1.8.
+    # The bursts for 13-14h and 14-15h are missed. With the lowered bound
+    # the counter at 15:10 proves 1158.6 - 0.5 - 1156.1 = 2.0 kWh missing,
+    # not 1.7.
     ledger.apply("tech", 15, {"1": 1158.6}, _ts(14, 15, 10), "WS")
-    assert ledger.lifetime("tech") == pytest.approx(2.6)
+    assert ledger.lifetime("tech") == pytest.approx(2.5)
 
 
 def test_implausible_lifetime_jump_adds_nothing() -> None:
@@ -287,10 +293,10 @@ def test_lifetime_counter_mid_hour_without_a_gap_is_left_to_the_burst() -> None:
     assert _today(ledger, "tech", 14) == pytest.approx(3.0)
 
     # The 15-16h and 16-17h bursts are missed. The counter at 17:10 (1004.2)
-    # is compared with the reference from 13:00:40, not with one raised by
-    # the partial hour at 14:40.
+    # is compared with the reference from 13:00:40 (offset at most 999.1),
+    # not with one raised by the partial hour at 14:40: 2.1 kWh is added.
     assert ledger.apply("tech", 15, {"1": 1004.2}, _ts(14, 17, 10), "WS")
-    assert ledger.lifetime("tech") == pytest.approx(5.2)
+    assert ledger.lifetime("tech") == pytest.approx(5.1)
 
 
 def test_small_websocket_value_outside_burst_is_not_a_delta() -> None:
@@ -348,12 +354,13 @@ def test_missed_hours_followed_by_booked_hours_are_recovered() -> None:
     assert _leg(ledger)["complete_until"] == int(_ts(14, 1))
 
     # Counter at 05:25 on the 15th: 29.23 kWh up to 05:00 plus 0.42 since.
-    # 4.37 kWh is more than a 10 A leg can use since 04:00 (the last booked
-    # hour) but not since 02:00 (the last complete hour).
+    # The 4.27 kWh it proves missing (4.37 above the bottom of the
+    # reference's window) is more than a 10 A leg can use since 04:00 (the
+    # last booked hour) but not since 02:00 (the last complete hour).
     assert ledger.apply("tech", 10, {"1": 1029.6}, _ts(15, 5, 25), "WS")
 
-    assert ledger.lifetime("tech") == pytest.approx(29.6)
-    assert _today(ledger, "tech", 15) == pytest.approx(5.0 + 4.37)
+    assert ledger.lifetime("tech") == pytest.approx(29.5)
+    assert _today(ledger, "tech", 15) == pytest.approx(5.0 + 4.27)
 
 
 def test_counter_after_a_gap_fill_adds_the_rest_of_the_claimed_hour() -> None:
@@ -372,13 +379,13 @@ def test_counter_after_a_gap_fill_adds_the_rest_of_the_claimed_hour() -> None:
     # The 05-06h burst is not booked again; 06-07h is.
     assert not ledger.apply("tech", 10, {"1": 1.0}, _ts(15, 6, 0, 29), "WS")
     assert ledger.apply("tech", 10, {"1": 1.0}, _ts(15, 7, 0, 29), "WS")
-    assert ledger.lifetime("tech") == pytest.approx(30.6)
+    assert ledger.lifetime("tech") == pytest.approx(30.5)
     assert _leg(ledger)["complete_until"] == int(_ts(15, 4))
 
     # Counter at 07:30: 31.23 kWh up to 07:00 plus 0.5 since. The rest of
     # 05-06h (05:25-06:00) and 07:00-07:30 are added.
     assert ledger.apply("tech", 10, {"1": 1031.7}, _ts(15, 7, 30), "WS")
-    assert ledger.lifetime("tech") == pytest.approx(31.7)
+    assert ledger.lifetime("tech") == pytest.approx(31.6)
 
 
 def test_counter_in_step_completes_the_ledger_over_an_idle_missed_hour() -> None:
@@ -451,10 +458,12 @@ def test_ledger_stored_without_complete_until_is_migrated() -> None:
     # As before: a counter at 15:40 without a gap is left to the burst.
     ledger.apply("tech", 15, {"1": 1001.7}, _ts(14, 15, 40), "WS")
     assert ledger.lifetime("tech") == pytest.approx(2.0)
-    # The rest of the claimed hour comes with the next counter (1 kW load).
+    # The rest of the claimed hour comes with the next counter (1 kW load),
+    # less the 0.1 kWh window of the stored offset.
+    assert _leg(ledger, "claimed")["offset_max"] == pytest.approx(1000.1)
     assert not ledger.apply("claimed", 15, {"1": 1.0}, _ts(14, 17, 0, 29), "WS")
     ledger.apply("claimed", 15, {"1": 1006.2}, _ts(14, 17, 30), "WS")
-    assert ledger.lifetime("claimed") == pytest.approx(6.2)
+    assert ledger.lifetime("claimed") == pytest.approx(6.1)
 
 
 def test_listing_value_equal_to_the_last_delta_is_not_booked() -> None:
@@ -476,12 +485,13 @@ def test_listing_value_equal_to_the_last_delta_is_not_booked() -> None:
     assert ledger.apply("tech", 15, {"1": 0.04}, _ts(14, 19, 0, 29), "WS")
     assert ledger.lifetime("tech") == pytest.approx(0.112349)
 
-    # The skipped hour is recovered by the next lifetime counter.
+    # The skipped hour is recovered by the next lifetime counter, as far as
+    # it proves it missing: 1000.2 - 0.05 - 1000.1.
     ledger.apply("idle", 15, {"1": 1000.0}, _ts(14, 16, 5), "WS")
     ledger.apply("idle", 15, {"1": 0.05}, _ts(14, 17, 0, 29), "WS")
     assert not ledger.apply("idle", 15, {"1": 0.05}, _ts(14, 18, 10), "REST")
     ledger.apply("idle", 15, {"1": 1000.2}, _ts(14, 19, 10), "WS")
-    assert ledger.lifetime("idle") == pytest.approx(0.2)
+    assert ledger.lifetime("idle") == pytest.approx(0.1)
 
 
 def test_stale_zero_listing_does_not_hide_a_missed_hour() -> None:
@@ -496,13 +506,13 @@ def test_stale_zero_listing_does_not_hide_a_missed_hour() -> None:
     assert _leg(ledger, "EV")["last_hour"] == int(_ts(14, 10))
     assert _leg(ledger, "EV")["complete_until"] == int(_ts(14, 10))
 
-    # The hub reconnects: 1000 + 1.2 (11-12h) + 0.1 (12-13h so far). 1.3 kWh
-    # is well above the 0.1 kWh rounding and below what a 40 A leg can use
-    # since 12:00 (1.87 + 0.1 kWh): had the zero been booked, 11-12h would
-    # count as complete and all of it would be left to the 13:00:29 burst,
-    # which books only 12-13h.
+    # The hub reconnects: 1000 + 1.2 (11-12h) + 0.1 (12-13h so far). The
+    # 1.2 kWh it proves missing (beyond the reference's 0.1 kWh window) is
+    # below what a 40 A leg can use since 12:00 (1.87 kWh): had the zero been
+    # booked, 11-12h would count as complete and all of it would be left to
+    # the 13:00:29 burst, which books only 12-13h.
     ledger.apply("EV", 40, {"1": 1001.3}, _ts(14, 12, 11, 40), "WS")
-    assert ledger.lifetime("EV") == pytest.approx(1.3)
+    assert ledger.lifetime("EV") == pytest.approx(1.2)
     assert _leg(ledger, "EV")["complete_until"] == int(_ts(14, 11))
     # 12-13h (0.6 kWh) is claimed by the counter; its burst is not booked.
     assert not ledger.apply("EV", 40, {"1": 0.6}, _ts(14, 13, 0, 29), "WS")
@@ -511,11 +521,10 @@ def test_stale_zero_listing_does_not_hide_a_missed_hour() -> None:
     for hour in range(16):
         ledger.apply("EV", 40, {"1": 0.0}, _ts(15, hour, 0, 29), "WS")
 
-    # The next counter adds the rest of 12-13h (0.5 kWh, well above the
-    # 0.1 kWh rounding).
+    # The next counter adds the rest of 12-13h (0.5 kWh).
     ledger.apply("EV", 40, {"1": 1001.8}, _ts(15, 16, 15), "WS")
-    assert ledger.lifetime("EV") == pytest.approx(1.8)
-    assert _today(ledger, "EV", 14) == pytest.approx(1.3)
+    assert ledger.lifetime("EV") == pytest.approx(1.7)
+    assert _today(ledger, "EV", 14) == pytest.approx(1.2)
     assert _today(ledger, "EV", 15) == pytest.approx(0.5)
 
 
@@ -540,17 +549,17 @@ def test_counter_above_the_current_hour_bound_fills_an_untracked_gap() -> None:
     assert _leg(ledger)["complete_until"] == int(_ts(14, 14))
 
     # 1000 + 0.5 (10-11h) + 3.0 (missed) + 0.2 (14-15h) + 0.1 (15-16h so
-    # far). 3.1 kWh is more than a 15 A breaker uses in 20 minutes (1.2 kWh
-    # + 0.1 kWh rounding), so it is missed energy, not the current hour's.
+    # far). The 3.0 kWh it proves missing is more than a 15 A breaker uses
+    # in 20 minutes (1.2 kWh), so it is missed energy, not the current hour's.
     assert ledger.apply("tech", 15, {"1": 1003.8}, _ts(14, 15, 20), "WS")
-    assert ledger.lifetime("tech") == pytest.approx(3.8)
+    assert ledger.lifetime("tech") == pytest.approx(3.7)
     assert _leg(ledger)["last_hour"] == int(_ts(14, 15))
     assert _leg(ledger)["complete_until"] == int(_ts(14, 14))
     assert _leg(ledger)["offset"] == 1000.0
 
-    # Within the bound (0.1 kWh in 100 s + 0.1 kWh rounding) the excess is
-    # still the current hour's; above it, it is a gap.
-    for key, counter, lifetime in (("within", 1000.2, 0.08), ("above", 1000.4, 0.4)):
+    # Within the bound (0.1 kWh in 100 s) the proven excess is still the
+    # current hour's; above it, it is a gap.
+    for key, counter, lifetime in (("within", 1000.2, 0.08), ("above", 1000.4, 0.3)):
         ledger.apply(key, 15, {"1": 1000.0}, _ts(14, 13, 30), "WS")
         ledger.apply(key, 15, {"1": 0.08}, _ts(14, 14, 0, 29), "WS")
         assert _leg(ledger, key)["complete_until"] == int(_ts(14, 13))
@@ -593,6 +602,260 @@ def test_daily_history_is_bounded() -> None:
         ledger.apply("tech", 15, {"1": 0.01}, _ts(day, 12, 0, 29), "WS")
 
     assert len(ledger.as_dict()["breakers"]["tech"]["daily"]) == ldata_energy.DAILY_KEEP_DAYS
+
+
+# ── Regression: 2026-10-16 hub outage ─────────────────────────────────
+#
+# The hub was offline 01:58-07:21, 07:42-12:00, 12:21-15:05 and from 15:34.
+# Lifetime counters arrived at each reconnect (07:21, 12:00:21, 15:05). The
+# leg states below are the stored ledger after the 07:21 reconnect (ledger
+# file of 2.0.12.dev6, written before offset_max existed).
+
+
+def _outage_ledger(key: str, lifetime: float, offset: float, counter: float, last_value: float) -> LDATAEnergyLedger:
+    ledger = LDATAEnergyLedger()
+    ledger.load(
+        {
+            "breakers": {
+                key: {
+                    "legs": {
+                        "1": {
+                            "lifetime": lifetime,
+                            "last_hour": int(_ts(16, 0)),
+                            "complete_until": int(_ts(16, 6)),
+                            "offset": offset,
+                            "anchor_time": _ts(16, 7, 21, 13),
+                            "last_value": last_value,
+                            "last_source": "WS",
+                            "last_counter": counter,
+                        },
+                        "2": {
+                            "lifetime": 0.0, "last_hour": int(_ts(16, 0)), "complete_until": None,
+                            "offset": None, "anchor_time": None, "last_value": 0.0,
+                            "last_source": "WS", "last_counter": None,
+                        },
+                    },
+                    "daily": {"2026-10-16": 0.0},
+                }
+            }
+        }
+    )
+    return ledger
+
+
+@pytest.mark.parametrize(
+    ("key", "lifetime", "offset", "reference", "counter"),
+    [
+        # Lights outside: 19.1 - (18.988 + 0.012) = 0.10000000000000142. The
+        # old rule added 0.1 kWh here (12:00:22) for a 1 W load.
+        ("lights_outside", 0.012, 18.988, 19.0, 19.1),
+        # Microwave: 400.4 - (400.287976 + 0.012024) = 0.0999999999999659. The
+        # old rule added nothing here, only by rounding luck.
+        ("microwave", 0.012024, 400.287976, 400.3, 400.4),
+        # Outlets tech cabinet: 1157.9 - (1157.391582 + 0.408418) =
+        # 0.10000000000013642. The old rule added 0.1 kWh.
+        ("tech_cabinet", 0.408418, 1157.391582, 1157.8, 1157.9),
+    ],
+)
+def test_one_counter_step_after_a_reconnect_adds_nothing(key, lifetime, offset, reference, counter) -> None:
+    ledger = _outage_ledger(key, lifetime, offset, reference, 0.0012)
+    raw_missing = counter - (offset + lifetime)
+    assert raw_missing != 0.1  # Whichever side of 0.1 the float lands on ...
+
+    # ... one counter step is quantization, not missed energy: the cloud
+    # total was anywhere in [reference, reference + 0.1) at 07:21 and in
+    # [counter, counter + 0.1) at 12:00:21.
+    ledger.apply(key, 15, {"1": counter}, _ts(16, 12, 0, 21), "WS")
+
+    assert ledger.lifetime(key) == pytest.approx(lifetime, abs=1e-9)
+    assert _today(ledger, key, 16) == 0.0
+    # Not claimed: the 11-12h burst eight seconds later is booked.
+    assert ledger.apply(key, 15, {"1": 0.0012}, _ts(16, 12, 0, 29), "WS")
+    assert ledger.lifetime(key) == pytest.approx(lifetime + 0.0012)
+
+
+def test_offset_window_is_migrated_from_a_stored_ledger() -> None:
+    ledger = _outage_ledger("lights_outside", 0.012, 18.988, 19.0, 0.0012)
+    assert _leg(ledger, "lights_outside")["offset_max"] == pytest.approx(19.088)
+    # An unquantized counter (seen from the 2-pole dryer) has no window.
+    dryer = LDATAEnergyLedger()
+    dryer.load(
+        {
+            "breakers": {
+                "dryer": {
+                    "legs": {
+                        "2": {
+                            "lifetime": 0.0056, "last_hour": int(_ts(16, 0)), "complete_until": int(_ts(16, 6)),
+                            "offset": 694.6626239999241, "anchor_time": _ts(16, 7, 21, 1),
+                            "last_value": 0.0005, "last_source": "WS", "last_counter": 694.6682239999227,
+                        }
+                    },
+                    "daily": {},
+                }
+            }
+        }
+    )
+    assert _leg(dryer, "dryer", "2")["offset_max"] == pytest.approx(694.6626239999241)
+    assert dryer.as_dict()["breakers"]["dryer"]["legs"]["2"]["offset_max"] == pytest.approx(694.6626239999241)
+
+
+def test_shortfall_within_one_step_is_added_by_a_later_counter() -> None:
+    """Outlets counter 1: counter 1285.5 at 07:21:05, 1285.6 at 12:00:21."""
+    ledger = _outage_ledger("counter1", 0.751924, 1284.748076, 1285.5, 0.00354)
+
+    # 0.1 above the expected 1285.5: within the window, nothing is added.
+    ledger.apply("counter1", 15, {"1": 1285.6}, _ts(16, 12, 0, 21), "WS")
+    assert ledger.lifetime("counter1") == pytest.approx(0.751924)
+    ledger.apply("counter1", 15, {"1": 0.024048}, _ts(16, 12, 0, 29), "WS")
+    assert ledger.lifetime("counter1") == pytest.approx(0.775972)
+
+    # The old rule then took the ledger as complete and kept comparing with
+    # the bottom of the 07:21 window (expected 1285.524). The window's top
+    # (offset_max 1284.848076) does not move with what is added, so energy
+    # missed in the next outages is added as soon as a counter proves it:
+    # 1285.7 at 15:05 proves 1285.7 - 0.775972 - 1284.848076 kWh.
+    ledger.apply("counter1", 15, {"1": 1285.7}, _ts(16, 15, 5, 0), "WS")
+    assert ledger.lifetime("counter1") == pytest.approx(1285.7 - 1284.848076)
+    assert _leg(ledger, "counter1")["offset_max"] == pytest.approx(1284.848076)
+
+
+def _replay_outages(power_kw, total_at_reference, days, quantize, ledger=None):
+    """Replay the 2026-10-16 outage pattern on a steady load for ``days`` days.
+
+    The cloud total is total_at_reference + power x time since 07:21:05 on
+    the 16th. Bursts (the exact delta of the cloud total) arrive at HH:00:29
+    while the hub is online; each reconnect brings the quantized total; the
+    listing is read at HH:06 and shows the last burst again while the hub
+    is offline. Returns (ledger, [(time, booked - cloud energy) ...]).
+    """
+    ledger = ledger or LDATAEnergyLedger()
+    t_ref = _ts(16, 7, 21, 5)
+
+    def total(t):
+        return total_at_reference + power_kw * (t - t_ref) / 3600.0
+
+    offline = []
+    for day in range(days):
+        base = _ts(16, 0) + day * 86400
+        for start, end in (((1, 58, 0), (7, 21, 5)), ((7, 42, 0), (12, 0, 21)), ((12, 21, 0), (15, 5, 0)), ((15, 34, 0), (23, 40, 0))):
+            offline.append(
+                (base + start[0] * 3600 + start[1] * 60 + start[2], base + end[0] * 3600 + end[1] * 60 + end[2])
+            )
+
+    def online(t):
+        return not any(a <= t < b for a, b in offline)
+
+    events = [(t_ref, "counter")]
+    for a, b in offline:
+        if b > t_ref:
+            events.append((b, "counter"))
+    hour = ldata_energy.hour_start(t_ref) + 3600
+    end = offline[-1][1] + 3 * 3600
+    while hour < end:
+        events.append((hour + 29, "burst"))
+        events.append((hour + 360, "listing"))
+        hour += 3600
+    events.sort()
+
+    baseline = total(ldata_energy.hour_start(t_ref))  # the ledger books the reference hour in full
+    last_burst = 0.0
+    errors = []
+    for t, kind in events:
+        if kind == "counter":
+            ledger.apply("leg", 15, {"1": quantize(total(t))}, t, "WS")
+        elif kind == "burst" and online(t):
+            h = ldata_energy.hour_start(t)
+            last_burst = total(h) - total(h - 3600)
+            ledger.apply("leg", 15, {"1": last_burst}, t, "WS")
+        elif kind == "listing":
+            ledger.apply("leg", 15, {"1": round(last_burst, 2)}, t, "REST", connected=online(t))
+        errors.append((t, kind, ledger.lifetime("leg") - (total(t) - baseline)))
+    return ledger, errors
+
+
+def _floor_counter(total):
+    return math.floor(total * 10 + 1e-9) / 10
+
+
+def _round_counter(total):
+    return round(total, 1)
+
+
+@pytest.mark.parametrize("quantize", [_floor_counter, _round_counter])
+@pytest.mark.parametrize(
+    ("power_kw", "total_at_reference"),
+    [
+        (0.0035, 1285.59),  # Outlets counter 1 (3.5 W), near the top of its 07:21 window
+        (0.0035, 1285.501),  # ... and near the bottom
+        (0.001, 19.0951),  # Lights outside (1 W): 19.0 at 07:21, 19.1 at 12:00:21
+        (0.034, 1157.84),  # Outlets tech cabinet (34 W)
+        (0.4, 2134.55),  # A heavier load
+    ],
+)
+def test_repeated_outages_neither_invent_nor_lose_energy(quantize, power_kw, total_at_reference) -> None:
+    _, errors = _replay_outages(power_kw, total_at_reference, 30, quantize)
+
+    # Never more than the cloud counted (allowing the 1e-6 kWh rounding).
+    assert max(error for _, _, error in errors) <= 1e-6
+    # At each reconnect, what the ledger is short stays below two counter
+    # steps, plus the energy used in the reference hour before 07:21:05
+    # (which the reference cannot place) and in the current hour so far
+    # (which its burst brings). It does not grow with the number of outages.
+    allowance = 0.2 + power_kw * (21 / 60 + 1) + 1e-6
+    after_counters = [error for _, kind, error in errors if kind == "counter"][1:]
+    assert len(after_counters) == 4 * 30 - 1
+    assert min(after_counters) >= -allowance
+
+
+def test_listing_is_not_booked_while_the_panel_is_offline() -> None:
+    """Outlets tech cabinet, 12:00-16:06 on 2026-10-16."""
+    ledger = _outage_ledger("tech_cabinet", 0.408418, 1157.391582, 1157.8, 0.035889)
+    ledger.apply("tech_cabinet", 15, {"1": 1157.9}, _ts(16, 12, 0, 22), "WS")
+    ledger.apply("tech_cabinet", 15, {"1": 0.0321}, _ts(16, 12, 0, 29), "WS")
+    assert ledger.lifetime("tech_cabinet") == pytest.approx(0.440518)
+
+    # Offline from 12:21. The listing still shows a delta of 0.03 kWh at
+    # 14:06:52; dev7 booked it as 13-14h.
+    assert not ledger.apply("tech_cabinet", 15, {"1": 0.03}, _ts(16, 14, 6, 52), "REST", connected=False)
+    # A WebSocket value in the burst window is not booked either.
+    assert not ledger.apply("tech_cabinet", 15, {"1": 0.0321}, _ts(16, 15, 0, 29), "WS", connected=False)
+    assert ledger.lifetime("tech_cabinet") == pytest.approx(0.440518)
+
+    # The reconnect counter at 15:05 (before the panel is reported online)
+    # adds what it proves missing and claims 15-16h.
+    assert ledger.apply("tech_cabinet", 15, {"1": 1158.0}, _ts(16, 15, 5, 0), "WS", connected=False)
+    assert ledger.lifetime("tech_cabinet") == pytest.approx(1158.0 - 1157.491582)
+    assert _leg(ledger, "tech_cabinet")["last_source"] == ldata_energy.COUNTER_CLAIM_SOURCE
+
+    # Offline again from 15:34: the 16:06:30 listing is not booked.
+    assert not ledger.apply("tech_cabinet", 15, {"1": 0.04}, _ts(16, 16, 6, 30), "REST", connected=False)
+    assert ledger.lifetime("tech_cabinet") == pytest.approx(1158.0 - 1157.491582)
+
+
+def test_stale_listing_guard_holds_after_a_counter_claim() -> None:
+    ledger = _outage_ledger("tech_cabinet", 0.408418, 1157.391582, 1157.8, 0.035889)
+    ledger.apply("tech_cabinet", 15, {"1": 0.0321}, _ts(16, 12, 0, 29), "WS")
+    # The counter at 12:00:40 claims 12-13h.
+    ledger.apply("tech_cabinet", 15, {"1": 1158.0}, _ts(16, 12, 0, 40), "WS")
+    claimed = ledger.lifetime("tech_cabinet")
+    assert _leg(ledger, "tech_cabinet")["last_source"] == ldata_energy.COUNTER_CLAIM_SOURCE
+    # The last delta stays the reference for the stale-listing guard (dev7
+    # cleared it, and booked the next listing value whatever it was).
+    assert _leg(ledger, "tech_cabinet")["last_value"] == pytest.approx(0.0321)
+
+    # The 13:00:29 burst for the claimed hour is not booked, but the listing
+    # shows it from then on, so it becomes the guard's reference.
+    assert not ledger.apply("tech_cabinet", 15, {"1": 0.0279}, _ts(16, 13, 0, 29), "WS")
+    assert _leg(ledger, "tech_cabinet")["last_value"] == pytest.approx(0.0279)
+    assert not ledger.apply("tech_cabinet", 15, {"1": 0.03}, _ts(16, 13, 6), "REST")
+
+    # Panel online, but the 14:00:29 burst is missed (WebSocket reconnect):
+    # the listing at 14:06 still shows 0.03 for 12-13h and is not booked
+    # as 13-14h.
+    assert not ledger.apply("tech_cabinet", 15, {"1": 0.03}, _ts(16, 14, 6), "REST")
+    assert ledger.lifetime("tech_cabinet") == pytest.approx(claimed)
+    # A new value is booked.
+    assert ledger.apply("tech_cabinet", 15, {"1": 0.05}, _ts(16, 15, 6), "REST")
 
 
 # ── Service ────────────────────────────────────────────────────────────
@@ -873,6 +1136,82 @@ def test_listing_recovery_uses_the_listing_rating(clock) -> None:
 
     assert service.energy_ledger.lifetime("tech") == pytest.approx(5.07)
 
+
+
+def _offline(panel: dict) -> dict:
+    """The panel as the listing shows it while the hub is offline."""
+    return {**panel, "status": "NOT_READY", "online": None, "offline": "2026-10-16T19:21:00.000Z"}
+
+
+def test_recovery_does_not_book_the_listing_of_an_offline_panel(clock) -> None:
+    # 2026-10-16: the hub went offline at 12:21; at 14:06:52 the listing
+    # still showed a delta of 0.03 kWh, and dev7 booked it as 13-14h.
+    service = _listing_service(clock, 0.03)
+    service.session.get.return_value = SimpleNamespace(
+        status_code=200,
+        json=lambda: [_offline(_ldata_panel([_raw_breaker("tech", 15, 0.04)]))],
+    )
+    clock.value = _ts(14, 18, 6)
+
+    assert service.refresh_ldata_energy() is False
+
+    assert service.energy_ledger.lifetime("tech") == pytest.approx(0.03)
+    assert not service.energy_ledger.has_delta_for("tech", int(_ts(14, 17)))
+    # The hour is not marked as read: once the panel is back the listing is
+    # read again.
+    assert service.needs_ldata_energy_recovery()
+
+
+def test_recovery_waits_while_the_cached_panel_state_is_offline(clock) -> None:
+    service = _listing_service(clock, 0.04)
+    service.status_data["panels"][0]["connected"] = False
+    clock.value = _ts(14, 18, 6)
+
+    assert not service.needs_ldata_energy_recovery()
+    assert service.refresh_ldata_energy() is False
+    service.session.get.assert_not_called()
+
+    # Back online within the hour: the missed burst is read from the listing.
+    service.status_data["panels"][0]["connected"] = True
+    assert service.needs_ldata_energy_recovery()
+    assert service.refresh_ldata_energy() is True
+    assert service.energy_ledger.lifetime("tech") == pytest.approx(0.07)
+
+
+def test_offline_listing_still_applies_a_lifetime_counter(clock) -> None:
+    service = _listing_service(clock, 0.03)
+    service.energy_ledger.apply("tech", 15, {"1": 1156.3}, _ts(14, 12, 5), "WS")
+    service.session.get.return_value = SimpleNamespace(
+        status_code=200,
+        json=lambda: [_offline(_ldata_panel([_raw_breaker("tech", 15, 1158.2)]))],
+    )
+    clock.value = _ts(14, 18, 6)
+
+    assert service.refresh_ldata_energy() is True
+
+    assert service.energy_ledger.lifetime("tech") > 0.03
+
+
+def test_websocket_burst_for_an_offline_panel_is_not_booked(clock) -> None:
+    service = LDATAService("", "", None)
+    service.parse_panels([_ldata_panel([_raw_breaker("tech", 15, 0.03)])])
+    service.status_data["panels"][0]["connected"] = False
+    clock.value = _ts(14, 18, 0, 29)
+
+    service._update_from_websocket(
+        {"modelName": "ResidentialBreaker", "modelId": "tech", "data": {"energyConsumption": 0.04, "energyConsumption2": 0.0}}
+    )
+
+    assert service.energy_ledger.lifetime("tech") == pytest.approx(0.03)
+
+
+def test_startup_listing_of_an_offline_panel_is_not_booked(clock) -> None:
+    service = LDATAService("", "", None)
+
+    service.parse_panels([_offline(_ldata_panel([_raw_breaker("tech", 15, 0.03)]))])
+
+    assert service.status_data["panels"][0]["connected"] is False
+    assert service.energy_ledger.lifetime("tech") in (None, 0.0)
 
 # ── Coordinator persistence ────────────────────────────────────────
 

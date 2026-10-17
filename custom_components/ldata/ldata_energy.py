@@ -23,22 +23,35 @@ breaker and leg:
 - The listing keeps its last value while the hub is offline, so a listing
   value within rounding of the last booked delta (also a zero after a
   booked zero) is not booked: it may be that hour's value again. The hour
-  is left to the next lifetime counter.
+  is left to the next lifetime counter. No delta at all is booked while the
+  panel is reported offline (``connected=False``); lifetime counters still
+  are.
 - Each leg tracks ``complete_until``, the last hour up to which the ledger
   has all of the leg's energy. It advances over hours booked one after
   another, and when a lifetime counter matches the ledger or becomes the
   reference. A missed hour stops it, also when later hours are booked.
-- A lifetime counter never lowers the ledger. The first one only records the
-  offset between the cloud counter and the ledger. A later one that is more
-  than 0.1 kWh above the expected counter adds the difference (energy from
-  missed hours, e.g. while Home Assistant was down), but only when
-  ``complete_until`` is before the hour before the current one, or when the
-  difference is more than the breaker can have used in the current hour so
-  far; otherwise the difference is the current hour's energy so far, which
-  that hour's burst will bring. The added difference also covers the current hour up to
-  now, so that hour is claimed (its burst is not booked) while
-  ``complete_until`` stays at the hour before it: the next counter adds the
-  rest of the claimed hour.
+- A lifetime counter never lowers the ledger. The counter is the cloud's
+  lifetime total quantized to 0.1 kWh, so it only says that the true total
+  lies in a 0.1 kWh window. The ledger keeps the offset between the cloud
+  total and its own total as a window too, ``offset`` .. ``offset_max``:
+  the first counter sets it to [counter, counter + 0.1] - ledger, and every
+  later counter lowers ``offset_max`` to counter + 0.1 - ledger if that is
+  smaller (the cloud total never runs behind the ledger, so this always
+  holds). A counter adds only the energy it proves missing,
+  counter - ledger - ``offset_max`` (energy from missed hours, e.g. while
+  the hub or Home Assistant was offline), never the quantization noise.
+  ``offset_max`` is not moved by what is added, so a shortfall too small to
+  prove at one counter is added by a later one: what the ledger is short
+  never exceeds 0.2 kWh per leg (plus, until a later counter narrows the
+  window, what the leg used in the hour of the first counter before it
+  arrived), however many outages there are. The
+  energy is added only when ``complete_until`` is before the hour before
+  the current one, or when it is more than the breaker can have used in the
+  current hour so far; otherwise it is the current hour's energy so far,
+  which that hour's burst will bring. The added energy also covers the
+  current hour up to now, so that hour is claimed (its burst is not booked)
+  while ``complete_until`` stays at the hour before it: the next counter
+  adds the rest of the claimed hour.
 - Daily totals are bucketed by the local date of the hour the energy was used
   in, so the 00:00:29 burst counts for the previous day.
 
@@ -78,10 +91,23 @@ HOURLY_BOUND_MARGIN = 2.0
 # lifetime counter.
 FALLBACK_RATING_AMPS = 60.0
 
-# Lifetime counters have 0.1 kWh resolution, and the offset recorded from the
-# first one carries up to 0.05 kWh of rounding, so smaller differences are
-# rounding, not missed energy.
-REANCHOR_MIN_KWH = 0.1
+# Lifetime counters are the cloud's lifetime total quantized to 0.1 kWh: a
+# counter C means the total is somewhere in a window C + a .. C + a + 0.1,
+# with a = 0 if the cloud truncates and a = -0.05 if it rounds. The ledger
+# only ever compares counters with each other (through the offset recorded
+# from the first one), so a cancels out and the two cases are handled alike.
+# A counter that is not a multiple of 0.1 kWh (seen from a 2-pole breaker,
+# e.g. 694.6682239999227) is the unquantized total: its window is empty.
+COUNTER_STEP_KWH = 0.1
+
+# Energy is compared and added rounded to 1e-6 kWh, the resolution of the
+# hourly deltas (e.g. 0.001198). Lifetime counters and ledger totals are
+# floats, so 19.1 - (18.988 + 0.012) is 0.10000000000000142, not 0.1; a
+# comparison on the raw floats would decide by rounding error.
+KWH_DECIMALS = 6
+
+# last_source of an hour claimed by a lifetime counter (no delta booked).
+COUNTER_CLAIM_SOURCE = "counter"
 
 # The REST listing keeps showing the previous hour's delta until the HH:00:29
 # burst has been processed by the cloud, so listing values are only booked
@@ -177,6 +203,16 @@ def _number(value: Any) -> float | None:
     return number
 
 
+def _kwh(value: float) -> float:
+    """Return ``value`` rounded to the ledger's energy resolution (see KWH_DECIMALS)."""
+    return round(value, KWH_DECIMALS) + 0.0  # + 0.0 turns -0.0 into 0.0
+
+
+def counter_window_kwh(value: float) -> float:
+    """Return the width of the window a lifetime counter puts the cloud total in."""
+    return COUNTER_STEP_KWH if is_counter_resolution(value) else 0.0
+
+
 def _hour(value: Any) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) else None
 
@@ -231,6 +267,12 @@ class LDATAEnergyLedger:
                     "last_hour": _hour(raw.get("last_hour")),
                     "complete_until": _hour(raw.get("complete_until")),
                     "offset": raw.get("offset") if isinstance(raw.get("offset"), (int, float)) else None,
+                    "offset_max": (
+                        raw.get("offset_max")
+                        if isinstance(raw.get("offset_max"), (int, float))
+                        and not isinstance(raw.get("offset_max"), bool)
+                        else None
+                    ),
                     "anchor_time": _number(raw.get("anchor_time")),
                     "last_value": _number(raw.get("last_value")),
                     "last_source": raw.get("last_source") if isinstance(raw.get("last_source"), str) else None,
@@ -238,6 +280,15 @@ class LDATAEnergyLedger:
                 }
                 if "complete_until" not in raw:
                     legs[leg]["complete_until"] = _migrated_complete_until(legs[leg])
+                if legs[leg]["offset"] is None:
+                    legs[leg]["offset_max"] = None
+                elif legs[leg]["offset_max"] is None or legs[leg]["offset_max"] < legs[leg]["offset"]:
+                    # Stored before the window existed: the offset was the
+                    # bottom of the last counter's window.
+                    last_counter = legs[leg]["last_counter"]
+                    legs[leg]["offset_max"] = legs[leg]["offset"] + (
+                        COUNTER_STEP_KWH if last_counter is None else counter_window_kwh(last_counter)
+                    )
             stored_daily = record.get("daily") if isinstance(record.get("daily"), dict) else {}
             daily = {
                 day: _number(value)
@@ -345,6 +396,7 @@ class LDATAEnergyLedger:
         received: float,
         source: str,
         name: str | None = None,
+        connected: bool = True,
     ) -> bool:
         """Apply energy values for one breaker.
 
@@ -356,6 +408,12 @@ class LDATAEnergyLedger:
             received: Epoch seconds the value was received.
             source: "WS", "WS-bulk" or "REST".
             name: Breaker name, for logging only.
+            connected: False if the breaker's panel is reported offline. The
+                    cloud then has no new hourly data for it: a listing
+                    value is the last delta shown again, so no delta is
+                    booked. Lifetime counters are still applied (they are
+                    absolute, and the first ones after a reconnect arrive
+                    before the panel is reported online again).
 
         Returns True if the ledger changed.
         """
@@ -380,6 +438,7 @@ class LDATAEnergyLedger:
                             "last_hour": None,
                             "complete_until": None,
                             "offset": None,
+                            "offset_max": None,
                             "anchor_time": None,
                             "last_value": None,
                             "last_source": None,
@@ -406,6 +465,8 @@ class LDATAEnergyLedger:
                     # resolution, otherwise a stale delta.
                     if is_counter_resolution(value):
                         changed |= self._apply_lifetime(record, state, value, bound, received, label, leg)
+                    continue
+                if not connected:
                     continue
                 if not from_websocket:
                     if into_hour < REST_SETTLE_SECS:
@@ -475,10 +536,19 @@ class LDATAEnergyLedger:
         zero, so a stray zero in the burst window does not claim the hour.
         A listing value never replaces anything: it is read after the burst
         window has closed and is at best a rounded copy of the burst.
+
+        For an hour claimed by a lifetime counter nothing is booked, but the
+        value is kept in ``last_value``: it is the delta the listing shows
+        until the next burst, which ``_may_be_stale_listing`` compares with.
         """
         booked = state["last_value"]
+        if state["last_source"] == COUNTER_CLAIM_SOURCE:
+            if booked != value:
+                state["last_value"] = value
+                self.dirty = True
+            return False
         if booked is None:
-            return False  # Hour claimed by a lifetime counter.
+            return False  # Claimed by a counter in a ledger stored before last_source "counter".
         if not (in_burst_window and booked == 0 and value > 0):
             return False
         state["lifetime"] += value
@@ -516,18 +586,30 @@ class LDATAEnergyLedger:
             )
             return True
 
-        expected = state["lifetime"] + state["offset"]
-        missing = value - expected
-        if missing <= REANCHOR_MIN_KWH:
-            if missing < 0:
-                # The ledger is ahead of the cloud counter. Lower the offset
-                # so later comparisons are not inflated by rounding or by
-                # partial-hour energy in the first reference.
-                self._set_reference(state, value, received)
-            else:
-                # In step with the counter: the ledger is complete up to now.
-                state["anchor_time"] = received
-                state["complete_until"] = delta_hour(received)
+        lifetime = state["lifetime"]
+        # The cloud total never runs behind the ledger (the ledger books
+        # only energy the cloud counted), so the true offset is below
+        # counter + its window - ledger: lower offset_max to that.
+        state["offset_max"] = min(state["offset_max"], value + counter_window_kwh(value) - lifetime)
+        if _kwh(state["offset_max"] - state["offset"]) < 0:
+            # The counter's window lies entirely below the ledger: the
+            # ledger is ahead of the cloud (e.g. the first counter came
+            # in mid-hour and that hour's burst then booked the part it
+            # already held). Take this counter as the new reference.
+            self._set_reference(state, value, received)
+            return True
+
+        # The energy the counter proves missing: the cloud total is at
+        # least the counter, and the ledger plus the highest possible
+        # offset is below it. A shortfall smaller than the window is not
+        # added here, but it is not dropped either: offset_max does not
+        # move up with what is added, so the next counter adds it once it
+        # is proven.
+        missing = _kwh(value - lifetime - state["offset_max"])
+        if missing <= 0:
+            # Nothing provably missing: the ledger is complete up to now.
+            state["anchor_time"] = received
+            state["complete_until"] = delta_hour(received)
             return True
 
         # The most the breaker can have used since the ledger was last known
@@ -552,22 +634,18 @@ class LDATAEnergyLedger:
         if (
             state["complete_until"] is not None
             and state["complete_until"] >= delta_hour(received)
-            and missing
-            <= bound * (received - hour_start(received)) / HOUR_SECS + REANCHOR_MIN_KWH
+            and missing <= _kwh(bound * (received - hour_start(received)) / HOUR_SECS)
         ):
             # The ledger has every hour up to the current one, so the excess
             # is the current hour's energy so far; its burst books the whole
             # hour (or, if the hour is claimed by an earlier counter, the
-            # next counter adds it). Keep the offset: raising it to this
-            # counter would put that partial hour into the reference and
-            # make the next real gap come up short by the same amount.
-            # More than the breaker can have used since the start of the
-            # hour means complete_until is wrong (a gap it did not track,
-            # e.g. in a ledger stored before the field existed): the excess
-            # is added below as missed energy.
+            # next counter adds it). More than the breaker can have used
+            # since the start of the hour means complete_until is wrong (a
+            # gap it did not track, e.g. in a ledger stored before the field
+            # existed): the excess is added below as missed energy.
             state["anchor_time"] = received
             _LOGGER.debug(
-                "Breaker %s leg %s: lifetime counter %.1f kWh is %.2f kWh above the "
+                "Breaker %s leg %s: lifetime counter %.1f kWh is %.3f kWh above the "
                 "ledger, all of it in the current hour — left to the hourly burst",
                 label, leg, value, missing,
             )
@@ -586,12 +664,13 @@ class LDATAEnergyLedger:
         if state["last_hour"] is None or state["last_hour"] < current_hour:
             state["last_hour"] = current_hour
         state["complete_until"] = delta_hour(received)
-        # The hour is claimed by the counter: no delta value to correct.
-        state["last_value"] = None
-        state["last_source"] = None
+        # The hour is claimed by the counter: no delta to correct. The last
+        # booked delta stays in last_value: the listing may still show it,
+        # and _may_be_stale_listing needs it to tell.
+        state["last_source"] = COUNTER_CLAIM_SOURCE
         self._add_daily(record, current_hour, missing)
         _LOGGER.info(
-            "Breaker %s leg %s: lifetime counter %.1f kWh is %.2f kWh above the "
+            "Breaker %s leg %s: lifetime counter %.1f kWh is %.3f kWh above the "
             "ledger — adding the missed energy", label, leg, value, missing,
         )
         return True
@@ -599,8 +678,10 @@ class LDATAEnergyLedger:
     @staticmethod
     def _set_reference(state: dict, value: float, received: float) -> None:
         # The reference takes in everything up to now, so the ledger is
-        # complete up to the hour before the current one.
+        # complete up to the hour before the current one. The cloud total
+        # is somewhere in the counter's window.
         state["offset"] = value - state["lifetime"]
+        state["offset_max"] = value + counter_window_kwh(value) - state["lifetime"]
         state["anchor_time"] = received
         state["complete_until"] = delta_hour(received)
 
