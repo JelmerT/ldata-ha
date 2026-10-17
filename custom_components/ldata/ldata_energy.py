@@ -591,13 +591,13 @@ class LDATAEnergyLedger:
         # only energy the cloud counted), so the true offset is below
         # counter + its window - ledger: lower offset_max to that.
         state["offset_max"] = min(state["offset_max"], value + counter_window_kwh(value) - lifetime)
-        if _kwh(state["offset_max"] - state["offset"]) < 0:
-            # The counter's window lies entirely below the ledger: the
-            # ledger is ahead of the cloud (e.g. the first counter came
-            # in mid-hour and that hour's burst then booked the part it
-            # already held). Take this counter as the new reference.
-            self._set_reference(state, value, received)
-            return True
+        if state["offset_max"] < state["offset"]:
+            # The counter's window lies entirely below the bottom of the
+            # offset window: the ledger got ahead of that bottom (e.g. the
+            # first counter came in mid-hour and that hour's burst then
+            # booked the part it already held). Restart the bottom from
+            # this counter; offset_max already is its top.
+            state["offset"] = value - lifetime
 
         # The energy the counter proves missing: the cloud total is at
         # least the counter, and the ledger plus the highest possible

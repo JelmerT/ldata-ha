@@ -171,6 +171,9 @@ def test_lower_lifetime_counter_never_lowers_the_ledger() -> None:
     # The cloud total is below 1156.6 and the ledger holds 0.5 kWh, so the
     # offset is at most 1156.1 (it was at most 1156.4).
     assert _leg(ledger)["offset_max"] == pytest.approx(1156.1)
+    # That is below the bottom of the reference window (1156.3), so the
+    # bottom restarts from this counter.
+    assert _leg(ledger)["offset"] == pytest.approx(1156.0)
 
     # The bursts for 13-14h and 14-15h are missed. With the lowered bound
     # the counter at 15:10 proves 1158.6 - 0.5 - 1156.1 = 2.0 kWh missing,
