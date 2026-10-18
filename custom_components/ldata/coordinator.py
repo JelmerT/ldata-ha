@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import requests
+import time
 
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.storage import Store
@@ -117,6 +118,9 @@ class LDATAUpdateCoordinator(DataUpdateCoordinator):
         self._websocket_connected = connected
         
         if connected and not was_connected:
+            # The subscriptions are sent: a cached delta the cloud re-sends
+            # now must not pass for the hourly burst.
+            self._service.energy_ledger.note_ws_connected(time.time())
             if self._websocket_ever_connected:
                 _LOGGER.debug(f"[v{self._service.version}] WebSocket reconnected")
             else:
@@ -445,6 +449,10 @@ class LDATAUpdateCoordinator(DataUpdateCoordinator):
             _LOGGER.debug(
                 f"[v{self._service.version}] Pushing ({inform_rate}s) update to HA: {breaker_count} breakers, {ct_count} CTs"
             )
+
+            # Notice an LDATA panel coming back online even when no energy
+            # value arrives (see LDATAService._ldata_panel_connected).
+            self._service.observe_ldata_panels()
 
             # This notifies all sensors to refresh from the cache
             self.async_set_updated_data(data)

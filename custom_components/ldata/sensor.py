@@ -1065,14 +1065,14 @@ class LDATADailyUsageSensor(_DailyEnergySensorMixin, LDATAEntity, SensorEntity, 
         """Daily consumption from the LDATA energy ledger.
 
         Energy is booked on the local date of the hour it was used in, and
-        the last hour of a day arrives at 00:00:29, so the sensor moves to
+        the last hour of a day arrives just after 00:00, so the sensor moves to
         the new date at 01:00. Within a day the state only grows by ledger
         increments, so the restored value of the first day after an upgrade
         never drops.
 
         A new day always reaches Home Assistant as a reset to 0. Normally
         the new day has no stored energy yet at the first update after
-        01:00 (the 01:00:29 burst is stored after that update), so the
+        01:00 (the 01:00 burst is stored after that update), so the
         state is 0 anyway. When it already has energy (Home Assistant was
         down across 01:00, or a lifetime counter added energy to the 00:00
         hour), the state is still 0 for this update and the next update

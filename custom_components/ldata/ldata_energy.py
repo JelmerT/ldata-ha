@@ -2,8 +2,9 @@
 
 An LDATA hub does not report a lifetime energy counter in normal operation.
 The breaker ``energyConsumption``/``energyConsumption2`` fields, both in the
-WebSocket burst the cloud sends every hour at HH:00:29 and in the REST panel
-listing, carry the kWh each leg used in the hour that just ended. Now and then
+WebSocket burst the cloud sends at the start of every hour (HH:00:01 to
+HH:00:37 so far) and in the REST panel listing, carry the kWh each leg used
+in the hour that just ended. Now and then
 (most likely after the hub reconnects to the cloud) the same fields carry the
 breaker's lifetime counter instead, with 0.1 kWh resolution.
 
@@ -12,8 +13,11 @@ breaker and leg:
 
 - A value above what the breaker can physically use in one hour is a lifetime
   counter. A WebSocket value is an hourly delta only inside the burst window
-  around HH:00:29; outside it, a multiple of 0.1 kWh is a lifetime counter
-  and anything else (a stale delta) is ignored. A listing value is an hourly
+  (the first 90 s of the hour); outside it, a multiple of 0.1 kWh is a
+  lifetime counter and anything else (a stale delta) is ignored. Inside the
+  window, a value equal to the leg's last delta that arrives within seconds
+  of a WebSocket (re)connect is ignored too: it may be the cached last
+  delta, not the burst. A listing value is an hourly
   delta, except a multiple of 0.1 kWh above 0.1 kWh, which may be a small
   lifetime counter and is ignored.
 - Each delta is applied once per (breaker, leg, hour): the hour it covers is
@@ -24,8 +28,9 @@ breaker and leg:
   value within rounding of the last booked delta (also a zero after a
   booked zero) is not booked: it may be that hour's value again. The hour
   is left to the next lifetime counter. No delta at all is booked while the
-  panel is reported offline (``connected=False``); lifetime counters still
-  are.
+  panel is reported offline (``connected=False``, which the service also
+  reports for a while after the panel comes back online, see
+  PANEL_RECONNECT_SETTLE_SECS); lifetime counters still are.
 - Each leg tracks ``complete_until``, the last hour up to which the ledger
   has all of the leg's energy. It advances over hours booked one after
   another, and when a lifetime counter matches the ledger or becomes the
@@ -53,7 +58,7 @@ breaker and leg:
   while ``complete_until`` stays at the hour before it: the next counter
   adds the rest of the claimed hour.
 - Daily totals are bucketed by the local date of the hour the energy was used
-  in, so the 00:00:29 burst counts for the previous day.
+  in, so the burst just after 00:00 counts for the previous day.
 
 The ledger is plain data (see ``as_dict``/``load``) so the coordinator can
 persist it across restarts. Once the coordinator persists it (``mark_saved``),
@@ -109,26 +114,49 @@ KWH_DECIMALS = 6
 # last_source of an hour claimed by a lifetime counter (no delta booked).
 COUNTER_CLAIM_SOURCE = "counter"
 
-# The REST listing keeps showing the previous hour's delta until the HH:00:29
+# The REST listing keeps showing the previous hour's delta until the hourly
 # burst has been processed by the cloud, so listing values are only booked
 # from this point in the hour on.
 REST_SETTLE_SECS = 300
 
-# The hourly burst arrives over the WebSocket at HH:00:29 (every hour of the
-# capture, all breakers in the same second); lifetime counters and stale
-# values (e.g. a cached delta re-sent after a reconnect) arrive at other
-# times. Only a WebSocket value received in [WS_DELTA_WINDOW_START_SECS,
-# WS_DELTA_WINDOW_END_SECS) into the hour is an hourly delta (if within the
-# physical bound). The window starts 9 s before the burst, for clock skew
-# between Home Assistant and the cloud, so a stale value from the first 20 s
-# of the hour cannot claim the hour before the burst. It ends 61 s after the
-# burst, for delivery lag; the window is 70 s, short enough that a small
-# lifetime counter (a new or rarely used breaker) seldom lands in it, and
-# well before REST_SETTLE_SECS, so a listing value is never booked for an
+# The hourly burst arrives over the WebSocket in the first seconds of the
+# hour, all breakers within about a second, one message per breaker carrying
+# only energyConsumption and energyConsumption2 (no hour or timestamp). The
+# second it arrives at moves: HH:00:29 every hour of the first capture
+# (2026-10-14/16), HH:00:01-HH:00:03 from 2026-10-16 18:00 to 2026-10-17
+# 02:00, HH:00:36-HH:00:37 from 2026-10-17 09:00 on. Lifetime counters and
+# stale values arrive at other times. Only a WebSocket value received in
+# [WS_DELTA_WINDOW_START_SECS, WS_DELTA_WINDOW_END_SECS) into the hour is an
+# hourly delta (if within the physical bound). The window starts at the top
+# of the hour; it ends 53 s after the latest burst seen, for delivery lag,
+# and well before REST_SETTLE_SECS, so a listing value is never booked for an
 # hour whose burst can still arrive. A burst outside the window is not
 # booked; the listing recovery books that hour instead.
-WS_DELTA_WINDOW_START_SECS = 20
+WS_DELTA_WINDOW_START_SECS = 0
 WS_DELTA_WINDOW_END_SECS = 90
+
+# The burst carries no hour of its own, so a delta the cloud re-sends from its
+# cache when the WebSocket (re)subscribes would look like the new hour's
+# burst inside the window. In the 42 reconnects of 2026-10-16/18 no energy
+# field arrived in the 60 s after the subscriptions, except a burst 7.9 s
+# after one (03:00:28.5 -> 03:00:36.4 on 2026-10-18) and a hub upload (see
+# PANEL_RECONNECT_SETTLE_SECS) 60 s after another. A WebSocket delta received less than this long after the connection came up
+# that equals the leg's last delta is not booked: it may be that delta
+# again, and booking it would count that hour twice. The hour is then left
+# to the listing recovery and the next lifetime counter.
+WS_RECONNECT_GUARD_SECS = 5
+
+# After the hub reconnects to the cloud (a hub outage, not a WebSocket
+# reconnect of ours), it uploads the hourly values it could not send: each
+# breaker then gets several energyConsumption messages a few seconds apart,
+# none of them saying which hour it covers (3 per breaker at 2026-10-17
+# 05:00:07-05:00:19, 210-222 s after the hub came back at 04:56:38, and at
+# 08:30:50-08:30:51, 295 s after 08:25:56). One of them landing in the burst
+# window would be booked for the wrong hour, possibly one that was already
+# booked. The service therefore reports a panel as offline to the ledger
+# (no deltas booked, lifetime counters applied) for this long after it sees
+# the panel come back online.
+PANEL_RECONNECT_SETTLE_SECS = 600
 
 # Lifetime counters are multiples of 0.1 kWh; bursts are unrounded floats.
 # The listing rounds its deltas to 0.01 kWh, so a listing value that is a
@@ -180,7 +208,7 @@ def local_date(ts: float) -> datetime.date:
 def current_daily_date(now: float) -> datetime.date:
     """Return the date whose daily total is still being filled at ``now``.
 
-    The last hour of a day arrives at 00:00:29 the next day, so the daily
+    The last hour of a day arrives just after 00:00 the next day, so the daily
     total switches to the new date at 01:00.
     """
     return local_date(delta_hour(now))
@@ -248,6 +276,8 @@ class LDATAEnergyLedger:
         # Totals as of the last save (see mark_saved); None while the ledger
         # is not persisted.
         self._saved: dict[str, dict[str, Any]] | None = None
+        # When the WebSocket last came up (see note_ws_connected).
+        self._ws_connected_at: float | None = None
 
     # ── Persistence ────────────────────────────────────────────────────
 
@@ -388,6 +418,15 @@ class LDATAEnergyLedger:
 
     # ── Updates ────────────────────────────────────────────────────────
 
+    def note_ws_connected(self, when: float) -> None:
+        """Record that the WebSocket (re)connected and subscribed at epoch ``when``.
+
+        For WS_RECONNECT_GUARD_SECS after it, a WebSocket delta equal to the
+        leg's last delta is not booked (see ``apply``).
+        """
+        with self._lock:
+            self._ws_connected_at = when
+
     def apply(
         self,
         key: str,
@@ -479,6 +518,14 @@ class LDATAEnergyLedger:
                 if state["last_hour"] == hour:
                     changed |= self._correct_hour(record, state, hour, value, source, in_burst_window)
                     continue
+                if from_websocket and self._may_be_cached_delta(state, value, received):
+                    _LOGGER.debug(
+                        "Breaker %s leg %s: WebSocket value %.6f kWh %.1f s after the "
+                        "WebSocket connected equals the last delta and may be the cached "
+                        "one — leaving the hour to the listing and the next lifetime "
+                        "counter", label, leg, value, received - self._ws_connected_at,
+                    )
+                    continue
                 if not from_websocket and self._may_be_stale_listing(state, value):
                     _LOGGER.debug(
                         "Breaker %s leg %s: listing value %.2f kWh matches the last booked "
@@ -501,13 +548,33 @@ class LDATAEnergyLedger:
                 self.dirty = True
         return changed
 
+    def _may_be_cached_delta(self, state: dict, value: float, received: float) -> bool:
+        """Return True if a WebSocket delta may be the last delta re-sent after a reconnect.
+
+        The burst carries no hour, so a delta the cloud re-sends when the
+        WebSocket subscribes cannot be told from the burst by its content;
+        only the time (right after the connection came up) and the value
+        (the leg's last delta again) set it apart. Skipping a real burst that
+        happens to repeat the last value (a constant load) costs at most that
+        one hour until the next lifetime counter; booking a re-sent delta
+        counts its hour twice, which nothing takes back.
+        """
+        connected_at = self._ws_connected_at
+        last = state["last_value"]
+        return (
+            connected_at is not None
+            and last is not None
+            and 0 <= received - connected_at < WS_RECONNECT_GUARD_SECS
+            and _kwh(value) == _kwh(last)
+        )
+
     @staticmethod
     def _may_be_stale_listing(state: dict, value: float) -> bool:
         """Return True if a listing value may be the last booked delta shown again.
 
         The listing keeps showing a breaker's last hourly delta until the
-        next burst replaces it. When the hub is offline across HH:00:29 there
-        is no new burst, and the listing shows the previous hour's delta
+        next burst replaces it. When the hub is offline across the hourly
+        burst there is no new burst, and the listing shows the previous hour's delta
         again; neither ``requestVersionHour`` (0 in every capture) nor the
         breaker's ``lastUpdated`` (it moves with power changes, not with the
         energy fields) tells which hour the value belongs to. Booking it

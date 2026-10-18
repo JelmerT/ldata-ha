@@ -222,10 +222,100 @@ def test_websocket_delta_outside_the_burst_window_is_not_booked() -> None:
 def test_burst_window_bounds() -> None:
     ledger = LDATAEnergyLedger()
 
-    assert not ledger.apply("a", 15, {"1": 0.032}, _ts(14, 17, 0, 19), "WS")
+    assert ledger.apply("a", 15, {"1": 0.032}, _ts(14, 17, 0, 0), "WS")
     assert ledger.apply("b", 15, {"1": 0.032}, _ts(14, 17, 0, 20), "WS")
-    assert ledger.apply("c", 15, {"1": 0.032}, _ts(14, 17, 1, 29), "WS")
+    assert ledger.apply("c", 15, {"1": 0.032}, _ts(14, 17, 1, 29) + 0.999, "WS")
     assert not ledger.apply("d", 15, {"1": 0.032}, _ts(14, 17, 1, 30), "WS")
+    assert not ledger.apply("e", 15, {"1": 0.032}, _ts(14, 16, 59, 59) + 0.999, "WS")
+
+
+# Arrival times of the hourly burst on live (dev8, 2026-10-16/18; the first
+# breaker of each burst) and the Outlets Outside / Fire place deltas booked
+# for the hours that were booked. Before 2026-10-16 every burst came at
+# HH:00:29.
+REAL_BURSTS = [
+    (16, 18, 0, 1.907),
+    (16, 19, 0, 1.912),
+    (16, 20, 0, 1.031),
+    # No burst at 21:00 (WebSocket up, panel online).
+    (16, 22, 0, 2.016),
+    (16, 23, 0, 1.204),
+    (17, 0, 0, 1.118),
+    (17, 1, 0, 1.087),
+    (17, 2, 0, 3.104),
+    (17, 9, 0, 36.402),
+    (17, 14, 0, 36.917),
+    (18, 3, 0, 36.409),
+    (18, 9, 0, 36.988),
+]
+
+
+def test_real_burst_arrival_times_are_in_the_window() -> None:
+    ledger = LDATAEnergyLedger()
+    for day, hour, minute, second in REAL_BURSTS:
+        received = _ts(day, hour, minute) + second
+        assert ledger.apply(f"b{day}{hour}", 15, {"1": 0.001202}, received, "WS"), (day, hour, second)
+
+
+def test_burst_moving_from_hh0001_to_hh0036_books_each_hour_once() -> None:
+    # Outlets Outside, 2026-10-17: bursts at 20:00:36 and 21:00:36, none at
+    # 22:00, then 23:00:36 and 00:00:36. Each value is booked for the hour
+    # before it; the missing 21-22h hour stops complete_until.
+    ledger = LDATAEnergyLedger()
+    bursts = [
+        (_ts(17, 20, 0, 36) + 0.497, 1.461426),
+        (_ts(17, 21, 0, 36) + 0.512, 1.457519),
+        (_ts(17, 23, 0, 36) + 0.488, 1.452637),
+        (_ts(18, 0, 0, 36) + 0.501, 1.459472),
+    ]
+    for received, value in bursts:
+        assert ledger.apply("outside", 30, {"1": value, "2": 0.0}, received, "WS")
+        # The same message again, as a duplicate frame a moment later.
+        assert not ledger.apply("outside", 30, {"1": value, "2": 0.0}, received + 0.4, "WS")
+
+    assert ledger.lifetime("outside") == pytest.approx(sum(v for _, v in bursts))
+    assert _today(ledger, "outside", 17) == pytest.approx(sum(v for _, v in bursts))
+    state = _leg(ledger, "outside")
+    assert state["last_hour"] == int(_ts(17, 23))
+    assert state["complete_until"] is None or state["complete_until"] < int(_ts(17, 21))
+
+
+def test_cached_delta_right_after_a_websocket_reconnect_is_not_booked() -> None:
+    ledger = LDATAEnergyLedger()
+    # Fire place, a constant load: the same delta every hour.
+    ledger.apply("fire", 15, {"1": 0.001202, "2": 0.0}, _ts(18, 2, 0, 36) + 0.4, "WS")
+
+    # 2026-10-18 03:00:28.541: the WebSocket reconnected and re-sent its
+    # subscriptions. A copy of the last delta 1.3 s later (the subscription
+    # replies arrive within that time) may be the cached delta, not the
+    # 02-03h burst.
+    ledger.note_ws_connected(_ts(18, 3, 0, 28) + 0.541)
+    assert not ledger.apply("fire", 15, {"1": 0.001202, "2": 0.0}, _ts(18, 3, 0, 29) + 0.8, "WS")
+    assert not ledger.has_delta_for("fire", int(_ts(18, 2)))
+
+    # The real burst came at 03:00:36.416, 7.9 s after the reconnect: booked,
+    # although it repeats the last delta.
+    assert ledger.apply("fire", 15, {"1": 0.001202, "2": 0.0}, _ts(18, 3, 0, 36) + 0.416, "WS")
+    assert ledger.lifetime("fire") == pytest.approx(0.002404)
+    assert ledger.has_delta_for("fire", int(_ts(18, 2)))
+
+
+def test_a_new_value_right_after_a_reconnect_is_booked() -> None:
+    ledger = LDATAEnergyLedger()
+    ledger.apply("outside", 30, {"1": 1.461426, "2": 0.0}, _ts(17, 20, 0, 36), "WS")
+    ledger.note_ws_connected(_ts(17, 21, 0, 33))
+
+    # Not the last delta: it cannot be the cached one.
+    assert ledger.apply("outside", 30, {"1": 1.457519, "2": 0.0}, _ts(17, 21, 0, 36), "WS")
+    # Zero after a booked zero, inside the guard: left to the listing.
+    ledger.apply("idle", 15, {"1": 0.0}, _ts(17, 20, 0, 36), "WS")
+    assert not ledger.apply("idle", 15, {"1": 0.0}, _ts(17, 21, 0, 36), "WS")
+    # The guard ends WS_RECONNECT_GUARD_SECS after the connect.
+    ledger.apply("const", 15, {"1": 0.0018}, _ts(17, 20, 0, 36), "WS")
+    assert ledger.apply(
+        "const", 15, {"1": 0.0018},
+        _ts(17, 21, 0, 33) + ldata_energy.WS_RECONNECT_GUARD_SECS, "WS",
+    )
 
 
 def test_stale_value_before_the_burst_does_not_claim_the_hour() -> None:
@@ -234,6 +324,7 @@ def test_stale_value_before_the_burst_does_not_claim_the_hour() -> None:
 
     # At 17:00:10 a reconnect re-sends the 15-16h delta; the 16-17h burst
     # follows at 17:00:29.
+    ledger.note_ws_connected(_ts(14, 17, 0, 9))
     assert not ledger.apply("tech", 15, {"1": 0.032349, "2": 0.0}, _ts(14, 17, 0, 10), "WS-bulk")
     assert ledger.apply("tech", 15, {"1": 0.032470, "2": 0.0}, _ts(14, 17, 0, 29), "WS")
 
@@ -1174,8 +1265,13 @@ def test_recovery_waits_while_the_cached_panel_state_is_offline(clock) -> None:
     assert service.refresh_ldata_energy() is False
     service.session.get.assert_not_called()
 
-    # Back online within the hour: the missed burst is read from the listing.
+    # Back online within the hour: the missed burst is read from the
+    # listing, once the panel has been back for PANEL_RECONNECT_SETTLE_SECS.
     service.status_data["panels"][0]["connected"] = True
+    assert not service.needs_ldata_energy_recovery()
+    clock.value = _ts(14, 18, 6) + ldata_energy.PANEL_RECONNECT_SETTLE_SECS - 1
+    assert not service.needs_ldata_energy_recovery()
+    clock.value = _ts(14, 18, 6) + ldata_energy.PANEL_RECONNECT_SETTLE_SECS
     assert service.needs_ldata_energy_recovery()
     assert service.refresh_ldata_energy() is True
     assert service.energy_ledger.lifetime("tech") == pytest.approx(0.07)
@@ -1206,6 +1302,102 @@ def test_websocket_burst_for_an_offline_panel_is_not_booked(clock) -> None:
     )
 
     assert service.energy_ledger.lifetime("tech") == pytest.approx(0.03)
+
+
+
+def _ws_energy(service: LDATAService, breaker_id: str, ec1: float, ec2: float = 0.0) -> None:
+    service._update_from_websocket(
+        {"modelName": "ResidentialBreaker", "modelId": breaker_id,
+         "data": {"energyConsumption": ec1, "energyConsumption2": ec2}}
+    )
+
+
+def test_hub_upload_after_an_outage_is_not_booked(clock) -> None:
+    # 2026-10-17: the hub was offline 02:17-04:56. At 04:56:38 it came back
+    # (first panel frame), at 04:56:48 the kitchen cabinets breaker sent its
+    # lifetime counter, and at 05:00:07.558, 05:00:08.088 and 05:00:19.620
+    # every breaker got an energyConsumption message, three per breaker,
+    # none saying which hour it covers.
+    service = LDATAService("", "", None)
+    clock.value = _ts(17, 1, 6, 54)
+    service.parse_panels([_ldata_panel([
+        _raw_breaker("cabinets", 15, 0.0101), _raw_breaker("tech", 15, 0.0401, position=3),
+    ])])
+    clock.value = _ts(17, 2, 17, 34)
+    service.status_data["panels"][0]["connected"] = False
+    service.observe_ldata_panels()
+    clock.value = _ts(17, 4, 56, 38)
+    service.status_data["panels"][0]["connected"] = True
+    clock.value = _ts(17, 4, 56, 40)
+    service.observe_ldata_panels()
+
+    ledger = service.energy_ledger
+    ledger.apply("cabinets", 15, {"1": 457.9}, _ts(16, 17, 27, 6), "WS")
+    clock.value = _ts(17, 4, 56, 48) + 0.985
+    _ws_energy(service, "cabinets", 458.1, 0.0)
+    cabinets = ledger.lifetime("cabinets")
+    assert cabinets > 0.0101  # The counter is applied while the panel settles.
+
+    for second, tech, cab in ((7.558, 0.0398, 0.0102), (8.088, 0.0402, 0.0099), (19.620, 0.0396, 0.0101)):
+        clock.value = _ts(17, 5, 0, 0) + second
+        _ws_energy(service, "tech", tech)
+        _ws_energy(service, "cabinets", cab)
+    assert ledger.lifetime("tech") == pytest.approx(0.0401)
+    assert ledger.lifetime("cabinets") == pytest.approx(cabinets)
+    assert not ledger.has_delta_for("tech", int(_ts(17, 4)))
+
+    # The listing is not read while the panel settles either, nor booked if
+    # read for another panel.
+    clock.value = _ts(17, 5, 6)
+    assert not service.needs_ldata_energy_recovery()
+    service.auth_token = "token"
+    service.residence_id_list = ["res-1"]
+    service.session = MagicMock()
+    service.session.get.return_value = SimpleNamespace(
+        status_code=200,
+        json=lambda: [_ldata_panel([_raw_breaker("tech", 15, 0.04, position=3)])],
+    )
+    assert service._refresh_ldata_energy_locked() is False
+    assert ledger.lifetime("tech") == pytest.approx(0.0401)
+    assert service._energy_recovery_hour is None
+
+    # Ten minutes after the hub came back, deltas are booked again.
+    clock.value = _ts(17, 4, 56, 40) + ldata_energy.PANEL_RECONNECT_SETTLE_SECS
+    assert service._ldata_panel_connected("LDATA-1")
+    clock.value = _ts(17, 6, 0, 36) + 0.4
+    _ws_energy(service, "tech", 0.0399)
+    assert ledger.lifetime("tech") == pytest.approx(0.08)
+
+
+def test_hub_reconnect_is_noticed_without_an_energy_value(clock) -> None:
+    # The coordinator calls observe_ldata_panels on every push, so the
+    # settle period starts when the panel is seen online, not at the next
+    # burst.
+    service = LDATAService("", "", None)
+    service.parse_panels([_ldata_panel([_raw_breaker("tech", 15, 0.03)])])
+    service.status_data["panels"][0]["connected"] = False
+    clock.value = _ts(17, 8, 25, 0)
+    service.observe_ldata_panels()
+    service.status_data["panels"][0]["connected"] = True
+    clock.value = _ts(17, 8, 26, 39)
+    service.observe_ldata_panels()
+
+    # The upload at 08:30:50 and the 09:00:36 burst, 34 minutes later.
+    clock.value = _ts(17, 8, 26, 39) + ldata_energy.PANEL_RECONNECT_SETTLE_SECS - 1
+    assert not service._ldata_panel_connected("LDATA-1")
+    clock.value = _ts(17, 9, 0, 36) + 0.4
+    _ws_energy(service, "tech", 0.0328)
+    assert service.energy_ledger.lifetime("tech") == pytest.approx(0.0628)
+
+
+def test_panel_online_at_startup_does_not_settle(clock) -> None:
+    service = LDATAService("", "", None)
+    service.parse_panels([_ldata_panel([_raw_breaker("tech", 15, 0.03)])])
+    clock.value = _ts(14, 18, 0, 36)
+
+    _ws_energy(service, "tech", 0.04)
+
+    assert service.energy_ledger.lifetime("tech") == pytest.approx(0.07)
 
 
 def test_startup_listing_of_an_offline_panel_is_not_booked(clock) -> None:
@@ -1242,6 +1434,24 @@ def _ledger_coordinator(stored: dict | None) -> LDATAUpdateCoordinator:
     )
     coordinator.async_update_listeners = MagicMock()
     return coordinator
+
+
+def test_coordinator_push_tracks_the_ldata_panel_state() -> None:
+    coordinator = LDATAUpdateCoordinator.__new__(LDATAUpdateCoordinator)
+    coordinator._service = MagicMock(version="test", _shutdown_requested=False)
+    coordinator._service.status_data = {"breakers": {}, "cts": {}}
+    coordinator._hass = SimpleNamespace(loop=MagicMock())
+    coordinator.config_entry = SimpleNamespace(options={})
+    coordinator._websocket_connected = True
+    coordinator._debounce_timer = None
+    coordinator.async_set_updated_data = MagicMock()
+    coordinator._save_energy_ledger = MagicMock()
+    coordinator._log_data_if_enabled = MagicMock()
+
+    coordinator._apply_debounced_update()
+
+    coordinator._service.observe_ldata_panels.assert_called_once_with()
+    coordinator.async_set_updated_data.assert_called_once()
 
 
 def _stored_ledger() -> dict:
