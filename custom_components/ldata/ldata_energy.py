@@ -755,6 +755,7 @@ class LDATAEnergyLedger:
         leg: str,
     ) -> bool:
         """Book the part of a claimed hour after the claiming counter (see ``_claimed_rest``)."""
+        split = state["claim"]["wh"] is not None and hour_wh is not None and hour_wh > 0
         rest = self._claimed_rest(state, value, hour_wh)
         state["claim"] = None
         self.dirty = True
@@ -762,7 +763,7 @@ class LDATAEnergyLedger:
             "Breaker %s leg %s: %.6f kWh for the hour from %s, claimed by a lifetime counter "
             "that covered %.6f kWh of it — booking %.6f kWh (%s)",
             label, leg, value, dt_util.as_local(dt_util.utc_from_timestamp(hour)).strftime("%Y-%m-%d %H:%M"),
-            value - rest, rest, "split by power x time" if hour_wh else "no power x time: the certain part only",
+            value - rest, rest, "split by power x time" if split else "no power x time: the certain part only",
         )
         if rest <= 0:
             return False
