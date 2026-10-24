@@ -2576,7 +2576,7 @@ class LDATAEnergyUsageSensor(LDATACTEntity, SensorEntity, RestoreEntity):
 # ── Breaker diagnostic sensors ───────────────────────────────────────
 
 
-class LDATABreakerStateSensor(LDATAEntity, SensorEntity):
+class LDATABreakerStateSensor(PanelOnlineMixin, LDATAEntity, SensorEntity):
     """Expose raw breaker state and trip context."""
 
     _attr_entity_category = EntityCategory.DIAGNOSTIC
@@ -2630,7 +2630,7 @@ class LDATABreakerStateSensor(LDATAEntity, SensorEntity):
         return "breaker_state"
 
 
-class LDATABreakerOperationalStateSensor(LDATAEntity, SensorEntity):
+class LDATABreakerOperationalStateSensor(PanelOnlineMixin, LDATAEntity, SensorEntity):
     """Breaker operational state diagnostic sensor.
 
     Reports the operationalState field from the Leviton API.

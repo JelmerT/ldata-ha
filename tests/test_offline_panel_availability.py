@@ -1,10 +1,10 @@
-"""Tests for live readings going unavailable while their panel is offline."""
+"""Tests for panel entities going unavailable while their panel is offline."""
 
 from types import SimpleNamespace
 
 import pytest
 
-from custom_components.ldata import sensor
+from custom_components.ldata import binary_sensor, sensor, switch
 from custom_components.ldata.ldata_base_entity import (
     PanelOnlineMixin,
     is_panel_offline,
@@ -36,6 +36,13 @@ def _coordinator(connected=True):
         "power": 92.5,
         "current": 0.8,
         "bleRSSI": -70,
+        "state": "ManualON",
+        "remoteState": "RemoteON",
+        "operationalState": "Normal",
+        "blinkLED": False,
+        "overCurrent": False,
+        "overVoltage": False,
+        "underVoltage": False,
     }
     ct = {
         "id": "1",
@@ -90,15 +97,39 @@ def _live_entities(coordinator):
     }
 
 
+def _state_entities(coordinator):
+    breaker = coordinator.data["breakers"]["B1"]
+    panel_data = _panel_entity_data(coordinator)
+    return {
+        "breaker status": binary_sensor.LDATABinarySensor(coordinator, breaker),
+        "breaker over current": binary_sensor.LDATABreakerOverCurrentSensor(coordinator, breaker),
+        "breaker over voltage": binary_sensor.LDATABreakerOverVoltageSensor(coordinator, breaker),
+        "breaker under voltage": binary_sensor.LDATABreakerUnderVoltageSensor(coordinator, breaker),
+        "panel over voltage": binary_sensor.LDATAPanelOverVoltageSensor(coordinator, panel_data),
+        "panel under voltage": binary_sensor.LDATAPanelUnderVoltageSensor(coordinator, panel_data),
+        "breaker switch": switch.LDATASwitch(coordinator, breaker),
+        "blink LED switch": switch.LDATABlinkLEDSwitch(coordinator, breaker),
+        "breaker state": sensor.LDATABreakerStateSensor(coordinator, breaker),
+        "breaker operational state": sensor.LDATABreakerOperationalStateSensor(coordinator, breaker),
+    }
+
+
+def _entities(coordinator):
+    return {**_live_entities(coordinator), **_state_entities(coordinator)}
+
+
+ENTITY_NAMES = list(_entities(_coordinator()))
+
+
 def _set_connected(coordinator, connected):
     panel = coordinator.data["panels"][0]
     coordinator.data["panels"] = [{**panel, "connected": connected}]
 
 
-@pytest.mark.parametrize("name", list(_live_entities(_coordinator())))
-def test_live_reading_unavailable_while_panel_offline(name) -> None:
+@pytest.mark.parametrize("name", ENTITY_NAMES)
+def test_entity_unavailable_while_panel_offline(name) -> None:
     coordinator = _coordinator()
-    entity = _live_entities(coordinator)[name]
+    entity = _entities(coordinator)[name]
     assert entity.available is True
 
     _set_connected(coordinator, False)
@@ -108,10 +139,10 @@ def test_live_reading_unavailable_while_panel_offline(name) -> None:
     assert entity.available is True
 
 
-@pytest.mark.parametrize("name", list(_live_entities(_coordinator())))
-def test_live_reading_unavailable_when_coordinator_update_fails(name) -> None:
+@pytest.mark.parametrize("name", ENTITY_NAMES)
+def test_entity_unavailable_when_coordinator_update_fails(name) -> None:
     coordinator = _coordinator()
-    entity = _live_entities(coordinator)[name]
+    entity = _entities(coordinator)[name]
 
     coordinator.last_update_success = False
 
@@ -132,9 +163,10 @@ def test_panel_without_connected_flag_or_missing_is_not_offline() -> None:
     assert entity.available is True
 
 
-def test_offline_flag_only_affects_entities_of_that_panel() -> None:
+@pytest.mark.parametrize("name", ENTITY_NAMES)
+def test_offline_flag_only_affects_entities_of_that_panel(name) -> None:
     coordinator = _coordinator()
-    entity = _live_entities(coordinator)["breaker power"]
+    entity = _entities(coordinator)[name]
 
     coordinator.data["panels"].append({"id": "LDATA-2", "connected": False})
 
