@@ -42,6 +42,12 @@ def _pacific_time():
     dt_util.set_default_time_zone(previous)
 
 
+@pytest.fixture(autouse=True)
+def _hourly_mode(monkeypatch):
+    """Run the LDATA panels of these tests in hourly mode (see test_ldata_energy_mode.py for auto)."""
+    monkeypatch.setattr(LDATAService, "_energy_tracking_option", lambda self: "hourly")
+
+
 def _today(ledger: LDATAEnergyLedger, key: str, day: int) -> float | None:
     return ledger.daily(key, datetime.date(2026, 10, day))
 

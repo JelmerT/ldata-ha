@@ -29,11 +29,15 @@ from .const import (
     HW_COUNTER_MIN_PLAUSIBLE_KWH,
     HW_COUNTER_POWER_MARGIN, HW_COUNTER_TRANSIENT_KWH,
     DEVICE_TYPE_BRIDGE, is_decora_bridge,
+    ENERGY_TRACKING_AUTO, ENERGY_TRACKING_COUNTER, ENERGY_TRACKING_HOURLY,
+    ENERGY_TRACKING_MODE, ENERGY_TRACKING_OPTIONS,
 )
 from .ldata_energy import (
+    DELTA_EVIDENCE_HOURS,
     HOUR_SECS,
     PANEL_RECONNECT_SETTLE_SECS,
     REST_SETTLE_SECS,
+    HourlyDeltaDetector,
     LDATAEnergyLedger,
     delta_hour,
     hour_start,
@@ -228,11 +232,14 @@ class LDATAService:
         self._hw_counter_evidence: dict[str, int] = {}
         self._hw_counter_evidence_at: dict[str, float] = {}
         # Ids of LDATA (ResidentialBreakerPanel) panels. Their breaker
-        # energyConsumption values are hourly deltas, booked in energy_ledger.
+        # energyConsumption values are booked in energy_ledger; the sensors
+        # follow it for the panels in hourly mode (panel_uses_hourly_energy).
         self._ldata_panel_ids: set[str] = set()
         # Lifetime/daily energy for LDATA breakers. Loaded and saved by the
         # coordinator.
         self.energy_ledger = LDATAEnergyLedger()
+        # Evidence that a panel's values are hourly deltas (auto mode).
+        self._delta_detector = HourlyDeltaDetector()
         # Hour (delta_hour) for which the listing was last read to recover
         # missed hourly bursts — at most one read per hour.
         self._energy_recovery_hour: int | None = None
@@ -1799,6 +1806,8 @@ class LDATAService:
         applied: the listing then shows the last delta again. Returns True if
         the ledger changed.
         """
+        if self._energy_tracking_option() == ENERGY_TRACKING_COUNTER:
+            return False
         values = {}
         if "energyConsumption" in raw:
             values["1"] = raw["energyConsumption"]
@@ -1816,6 +1825,8 @@ class LDATAService:
             connected = self._ldata_panel_connected(breaker.get("panel_id"), received)
         key = breaker.get("stable_id") or breaker["id"]
         received = time.time() if received is None else received
+        if connected:
+            self._detect_hourly_deltas(breaker.get("panel_id"), key, values, source, received)
         return self.energy_ledger.apply(
             key,
             rating,
@@ -1826,6 +1837,73 @@ class LDATAService:
             connected=connected,
             hour_wh=lambda hour: self._ldata_leg_hour_wh(key, hour, received),
         )
+
+    def _energy_tracking_option(self) -> str:
+        """Return the energy tracking mode option (auto unless set to hourly or counter)."""
+        options = getattr(self.entry, "options", None) or {}
+        try:
+            mode = options.get(ENERGY_TRACKING_MODE, ENERGY_TRACKING_AUTO)
+        except AttributeError:
+            return ENERGY_TRACKING_AUTO
+        return mode if mode in ENERGY_TRACKING_OPTIONS else ENERGY_TRACKING_AUTO
+
+    def _detect_hourly_deltas(self, panel_id, key: str, values: dict, source: str, received: float) -> None:
+        """Feed a panel's energy values to the delta detector (auto mode, undecided panels only).
+
+        The panel switches to the ledger once its values have behaved like
+        hourly deltas (see HourlyDeltaDetector). Values of a panel that is
+        offline or just back online are not used: the hub then uploads
+        older values.
+        """
+        if (
+            not panel_id
+            or self._energy_tracking_option() != ENERGY_TRACKING_AUTO
+            or self.energy_ledger.panel_mode(panel_id) is not None
+        ):
+            return
+        if self._delta_detector.observe(panel_id, key, values, source, received):
+            self._switch_panel_to_hourly(
+                panel_id,
+                f"its energyConsumption values dropped repeatedly in {DELTA_EVIDENCE_HOURS} different "
+                f"hours, which a lifetime counter never does",
+            )
+
+    def _switch_panel_to_hourly(self, panel_id: str, reason: str) -> None:
+        """Move an LDATA panel's consumption energy to the hourly ledger, persistently.
+
+        The sensors follow the ledger from their next update on, continuing
+        from their current state (see the sensors' _update_hourly).
+        Hardware-counter mode is off for the panel, as when it is parsed in
+        hourly mode.
+        """
+        if not self.energy_ledger.set_panel_mode(panel_id, ENERGY_TRACKING_HOURLY):
+            return
+        self._panel_has_hw_counters[panel_id] = False
+        _LOGGER.info(
+            f"[v{self.version}] LDATA panel {panel_id}: {reason} — consumption energy now "
+            f"comes from the hourly-delta ledger (Energy tracking mode: auto)"
+        )
+
+    def _adopt_premode_ledger(self, panel_id: str, breakers: dict) -> None:
+        """Keep a panel on the ledger if a version before panel modes already tracked it there."""
+        if (
+            self._energy_tracking_option() != ENERGY_TRACKING_AUTO
+            or self.energy_ledger.panel_mode(panel_id) is not None
+        ):
+            return
+        if any(
+            self.energy_ledger.booked_before_modes(b.get("stable_id") or b_id)
+            for b_id, b in breakers.items()
+            if b.get("panel_id") == panel_id
+        ):
+            self._switch_panel_to_hourly(panel_id, "its breakers are in the stored energy ledger")
+
+    def energy_tracking_modes(self) -> dict[str, str]:
+        """Return the energy tracking mode in use per LDATA panel (for diagnostics)."""
+        return {
+            panel_id: ENERGY_TRACKING_HOURLY if self.panel_uses_hourly_energy(panel_id) else ENERGY_TRACKING_COUNTER
+            for panel_id in sorted(self._ldata_panel_ids)
+        }
 
     def _ldata_panel_connected(self, panel_id: str | None, now: float | None = None) -> bool:
         """Return whether hourly deltas of a panel can be booked (True if unknown).
@@ -2654,6 +2732,8 @@ class LDATAService:
             # For v1 panels we check whether any breaker already has a non-zero
             # energyConsumption at startup (pre-toggle null → 0 means no counters).
             if panel_data["panel_type"] == "LDATA":
+                self._adopt_premode_ledger(panel["id"], breakers)
+            if self.panel_uses_hourly_energy(panel["id"]):
                 # energyConsumption is the kWh used in the last hour (now and
                 # then the lifetime counter), so whether it is > 0 at startup
                 # says nothing about hardware counters. Consumption energy
@@ -2707,7 +2787,7 @@ class LDATAService:
             # LDATA panels: the hourly energy arrives over the WebSocket (missed
             # hours are read from the listing by refresh_ldata_energy), and the
             # breaker poll has no LDATA endpoint (see _refresh_breaker_data_locked).
-            if fw_major >= 2 or panel_data["panel_type"] == "LDATA":
+            if fw_major >= 2 or self.panel_uses_hourly_energy(panel["id"]):
                 self._panel_needs_breaker_poll[panel["id"]] = False
             else:
                 panel_breaker_count = sum(
@@ -3074,8 +3154,18 @@ class LDATAService:
             )
 
     def panel_uses_hourly_energy(self, panel_id: str) -> bool:
-        """Return True if consumption energy for this panel comes from energy_ledger."""
-        return panel_id in self._ldata_panel_ids
+        """Return True if consumption energy for this panel comes from energy_ledger.
+
+        Only LDATA panels, per the Energy tracking mode option: hourly
+        always, counter never, auto (default) once the panel is stored as
+        hourly (see _detect_hourly_deltas and _adopt_premode_ledger).
+        """
+        if panel_id not in self._ldata_panel_ids:
+            return False
+        option = self._energy_tracking_option()
+        if option != ENERGY_TRACKING_AUTO:
+            return option == ENERGY_TRACKING_HOURLY
+        return self.energy_ledger.panel_mode(panel_id) == ENERGY_TRACKING_HOURLY
 
     def needs_ldata_energy_recovery(self, now: float | None = None) -> bool:
         """Return True if the listing or the energy history should be read for missed hours."""
@@ -3100,7 +3190,7 @@ class LDATAService:
         return any(
             not self.energy_ledger.has_delta_for(b.get("stable_id") or b_id, hour)
             for b_id, b in self.status_data.get("breakers", {}).items()
-            if b.get("panel_id") in self._ldata_panel_ids
+            if self.panel_uses_hourly_energy(b.get("panel_id"))
             and self._ldata_panel_connected(b.get("panel_id"), now)
         )
 
@@ -3146,7 +3236,7 @@ class LDATAService:
         since = hour_start(now - LDATA_HISTORY_LOOKBACK_SECS)
         needed = {}
         for b_id, b in self.status_data.get("breakers", {}).items():
-            if b.get("panel_id") not in self._ldata_panel_ids:
+            if not self.panel_uses_hourly_energy(b.get("panel_id")):
                 continue
             if not self._ldata_panel_connected(b.get("panel_id"), now):
                 continue
@@ -3218,7 +3308,7 @@ class LDATAService:
         if not isinstance(data, dict):
             return False
         for panel_id, panel in data.items():
-            if panel_id not in self._ldata_panel_ids or not isinstance(panel, dict):
+            if not self.panel_uses_hourly_energy(panel_id) or not isinstance(panel, dict):
                 continue
             computed = {
                 hour
@@ -3263,7 +3353,7 @@ class LDATAService:
                 continue
             read_ok = True
             for panel in result.json():
-                if panel.get("id") not in self._ldata_panel_ids:
+                if not self.panel_uses_hourly_energy(panel.get("id")):
                     continue
                 # An offline panel's listing shows the last delta again (no
                 # burst reached the cloud), so only lifetime counters are

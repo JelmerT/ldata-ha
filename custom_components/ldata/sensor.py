@@ -1245,6 +1245,9 @@ class LDATADailyUsageSensor(_DailyEnergySensorMixin, LDATAEntity, SensorEntity, 
                 self._update_hourly(ledger)
                 self.async_write_ha_state()
                 return
+            # Not following the ledger (any more): the next time it does,
+            # it continues from the state of that moment.
+            self._ledger_ref = None
 
             # Auto-detect mode on first update
             if self._use_hw_counters is None:
@@ -2399,6 +2402,9 @@ class LDATABreakerEnergyUsageSensor(LDATAEntity, SensorEntity, RestoreEntity):
                     if (ledger := self._hourly_ledger()) is not None:
                         self._update_hourly(ledger)
                         return
+                    # Not following the ledger (any more): the next time it
+                    # does, it continues from the state of that moment.
+                    self._ledger_ref = None
 
                     # On v2 panels the hw counters are period counters — integrate
                     # power×time to build a monotonically-increasing lifetime total.

@@ -1,7 +1,11 @@
 """Hourly energy ledger for LDATA (ResidentialBreakerPanel) breakers.
 
-An LDATA hub does not report a lifetime energy counter in normal operation.
-The breaker ``energyConsumption``/``energyConsumption2`` fields, both in the
+Some LDATA hubs (seen on a DAU, firmware 0.1.91) do not report a lifetime
+energy counter in normal operation, others are reported to. The ledger is
+therefore used per panel, only once the panel's values have shown that they
+are hourly deltas (see HourlyDeltaDetector), or when the user selects it.
+Until then a panel keeps the lifetime-counter path of the sensors. On such a
+hub the breaker ``energyConsumption``/``energyConsumption2`` fields, both in the
 WebSocket burst the cloud sends at the start of every hour (HH:00:01 to
 HH:00:37 so far) and in the REST panel listing, carry the kWh each leg used
 in the hour that just ended. Now and then
@@ -97,7 +101,7 @@ from typing import Any
 
 from homeassistant.util import dt as dt_util
 
-from .const import LOGGER_NAME
+from .const import ENERGY_TRACKING_COUNTER, ENERGY_TRACKING_HOURLY, LOGGER_NAME
 
 _LOGGER = logging.getLogger(LOGGER_NAME)
 
@@ -208,6 +212,21 @@ DAILY_KEEP_DAYS = 3
 
 LEGS = ("1", "2")
 
+# Detection of hourly deltas (see HourlyDeltaDetector). A drop counts when a
+# leg's value falls below this fraction of the previous value from the same
+# source: a lifetime counter never falls, and an hourly delta more than
+# halves from one hour to the next on most legs within hours.
+DELTA_DROP_RATIO = 0.5
+# Distinct hours of evidence (see HourlyDeltaDetector) after which a panel
+# is switched to the ledger. A counter reset (breaker or hub replaced) drops
+# each leg once and all breakers of a hub in one poll, so it makes at most
+# one such hour (two if the poll straddles the hour); a false switch would
+# take repeated resets in three different hours.
+DELTA_EVIDENCE_HOURS = 3
+
+# Panel tracking modes stored in the ledger (see LDATAEnergyLedger.panel_mode).
+PANEL_MODES = (ENERGY_TRACKING_HOURLY, ENERGY_TRACKING_COUNTER)
+
 
 def hourly_bound_kwh(rating: Any) -> float:
     """Return the most energy one leg of a breaker can use in one hour (kWh)."""
@@ -285,6 +304,68 @@ def _claim(value: Any) -> dict | None:
     return {"hour": value["hour"], "kwh": kwh, "wh": _number(value.get("wh"))}
 
 
+class HourlyDeltaDetector:
+    """Collect evidence that an LDATA panel reports hourly deltas, not lifetime counters.
+
+    A lifetime counter never decreases, except when it is reset (breaker or
+    hub replaced), which drops each leg once, all breakers of a hub in the
+    same poll. Hourly deltas go up and down with the load, and the
+    occasional lifetime counter a DAU sends among them is followed by a
+    large drop too. Each value is compared with the previous value of the
+    same breaker leg from the same source (a listing value is never
+    compared with a WebSocket value, which may be newer); a value below
+    DELTA_DROP_RATIO of it is a drop, a value of 0 is ignored (transient
+    zeros). An hour is evidence when a leg drops for the second time or
+    later, or legs of two or more breakers drop in it: a reset explains
+    neither (one drop per leg, one hour per hub). The panel is reported as
+    hourly once DELTA_EVIDENCE_HOURS hours are. Evidence is kept in memory
+    only; the decision is persisted by the ledger
+    (LDATAEnergyLedger.set_panel_mode).
+    """
+
+    def __init__(self) -> None:
+        """Start without evidence."""
+        self._last: dict[tuple[str, str, str], float] = {}
+        self._dropped: set[tuple[str, str]] = set()
+        # Per panel: the breakers with a first drop, per hour.
+        self._first_drops: dict[str, dict[int, set[str]]] = {}
+        self._hours: dict[str, set[int]] = {}
+        self._lock = threading.Lock()
+
+    def observe(
+        self, panel_id: str, key: str, values: dict[str, Any], source: str, received: float
+    ) -> bool:
+        """Note a breaker's energy values; return True if the panel reports hourly deltas."""
+        hour = hour_start(received)
+        with self._lock:
+            evidence = self._hours.setdefault(panel_id, set())
+            for leg, raw in values.items():
+                value = _number(raw)
+                if value is None or value <= 0:
+                    continue
+                previous = self._last.get((key, leg, source))
+                self._last[(key, leg, source)] = value
+                if previous is None or value >= previous * DELTA_DROP_RATIO:
+                    continue
+                if (key, leg) in self._dropped:
+                    evidence.add(hour)
+                    continue
+                self._dropped.add((key, leg))
+                first = self._first_drops.setdefault(panel_id, {})
+                for old in [h for h in first if h != hour]:
+                    del first[old]
+                breakers = first.setdefault(hour, set())
+                breakers.add(key)
+                if len(breakers) >= 2:
+                    evidence.add(hour)
+            return len(evidence) >= DELTA_EVIDENCE_HOURS
+
+    def evidence_hours(self, panel_id: str) -> int:
+        """Return the number of hours with evidence seen for the panel."""
+        with self._lock:
+            return len(self._hours.get(panel_id, ()))
+
+
 def _migrated_complete_until(state: dict) -> int | None:
     """Return ``complete_until`` for a leg stored before the field existed.
 
@@ -318,6 +399,11 @@ class LDATAEnergyLedger:
         self._saved: dict[str, dict[str, Any]] | None = None
         # When the WebSocket last came up (see note_ws_connected).
         self._ws_connected_at: float | None = None
+        # Tracking mode per panel id (see panel_mode).
+        self._panel_modes: dict[str, str] = {}
+        # Breakers of a ledger stored before panel modes existed (see
+        # booked_before_modes).
+        self._premode_keys: frozenset[str] = frozenset()
 
     # ── Persistence ────────────────────────────────────────────────────
 
@@ -384,8 +470,19 @@ class LDATAEnergyLedger:
                 if isinstance(day, str) and _number(value) is not None
             }
             breakers[str(key)] = {"legs": legs, "daily": daily}
+        stored_modes = data.get("panel_modes") if isinstance(data, dict) else None
+        modes = {
+            str(panel_id): mode
+            for panel_id, mode in (stored_modes if isinstance(stored_modes, dict) else {}).items()
+            if mode in PANEL_MODES
+        }
+        # A ledger stored without panel modes was written by the version
+        # that tracked every LDATA panel with the ledger.
+        premode = frozenset(breakers) if isinstance(data, dict) and "panel_modes" not in data else frozenset()
         with self._lock:
             self._breakers = breakers
+            self._panel_modes = modes
+            self._premode_keys = premode
             self.dirty = settled
 
     def as_dict(self) -> dict:
@@ -418,6 +515,7 @@ class LDATAEnergyLedger:
 
     def _as_dict_locked(self) -> dict:
         return {
+            "panel_modes": dict(self._panel_modes),
             "breakers": {
                 key: {
                     "legs": {leg: dict(state) for leg, state in record["legs"].items()},
@@ -426,6 +524,33 @@ class LDATAEnergyLedger:
                 for key, record in self._breakers.items()
             }
         }
+
+    # ── Panel tracking mode ────────────────────────────────────────────
+
+    def panel_mode(self, panel_id: str) -> str | None:
+        """Return the stored tracking mode of a panel (ENERGY_TRACKING_HOURLY), or None if undecided."""
+        with self._lock:
+            return self._panel_modes.get(panel_id)
+
+    def set_panel_mode(self, panel_id: str, mode: str) -> bool:
+        """Store a panel's tracking mode; return True if it changed (the ledger is then saved)."""
+        if mode not in PANEL_MODES:
+            raise ValueError(mode)
+        with self._lock:
+            if self._panel_modes.get(panel_id) == mode:
+                return False
+            self._panel_modes[panel_id] = mode
+            self.dirty = True
+            return True
+
+    def booked_before_modes(self, key: str) -> bool:
+        """Return True if the breaker is in a ledger stored before panel modes existed.
+
+        That version booked every LDATA panel from the ledger and its
+        sensors followed it, so such a breaker's panel stays on the ledger.
+        """
+        with self._lock:
+            return key in self._premode_keys
 
     # ── Queries ────────────────────────────────────────────────────────
 
