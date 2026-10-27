@@ -5,7 +5,8 @@ import logging
 import requests
 import time
 
-from homeassistant.core import HomeAssistant
+from homeassistant.const import EVENT_HOMEASSISTANT_FINAL_WRITE
+from homeassistant.core import Event, HomeAssistant, callback
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.exceptions import ConfigEntryAuthFailed
@@ -66,6 +67,14 @@ class LDATAUpdateCoordinator(DataUpdateCoordinator):
             update_interval=None,
             config_entry=entry,
         )
+
+        # Home Assistant does not unload config entries when it stops, so
+        # async_shutdown does not write the ledger then: write it in the
+        # final-write stage, while Home Assistant can still write files.
+        self._unsub_energy_final_write = hass.bus.async_listen_once(
+            EVENT_HOMEASSISTANT_FINAL_WRITE, self._async_energy_final_write
+        )
+        entry.async_on_unload(self._async_remove_energy_final_write)
         
         # Start the WebSocket Listener — this is the PRIMARY data source
         self._websocket_task = self.config_entry.async_create_background_task(
@@ -213,6 +222,29 @@ class LDATAUpdateCoordinator(DataUpdateCoordinator):
             self._debounce_timer.cancel()
             self._debounce_timer = None
 
+        await self._async_flush_energy_ledger()
+
+    @callback
+    def _async_remove_energy_final_write(self) -> None:
+        """Stop listening for the final-write stage (the entry unloads)."""
+        if self._unsub_energy_final_write is not None:
+            self._unsub_energy_final_write()
+            self._unsub_energy_final_write = None
+
+    async def _async_energy_final_write(self, _event: Event) -> None:
+        """Write the LDATA energy ledger as Home Assistant stops.
+
+        Bookings since the last push (up to ha_inform_rate seconds) are
+        not written yet, and the push timer may not fire again before Home
+        Assistant shuts its executor down. No save starts after this one:
+        Home Assistant cannot write files anymore once the stage is over.
+        """
+        self._unsub_energy_final_write = None
+        self._service._shutdown_requested = True
+        await self._async_flush_energy_ledger()
+
+    async def _async_flush_energy_ledger(self) -> None:
+        """Wait for a running ledger save, then write what is not stored yet."""
         # Let a running ledger write finish, so no write of this entry runs
         # after the unload (a reload would load the file before it lands,
         # and the late write would then replace newer bookings).
