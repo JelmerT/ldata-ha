@@ -4,7 +4,6 @@ import asyncio
 import logging
 import time
 import requests
-import time
 
 from homeassistant.const import EVENT_HOMEASSISTANT_FINAL_WRITE
 from homeassistant.core import Event, HomeAssistant, callback
